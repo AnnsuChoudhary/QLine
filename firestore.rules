@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedOrgAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'org_admin';
+    }
+
+    function publicDomain(email) {
+      return email.matches('.*@(gmail\\.com|yahoo\\.com|hotmail\\.com|outlook\\.com|icloud\\.com|proton\\.me)$');
+    }
+
+    function validOrgAdminProfile(uid, orgId) {
+      let profile = getAfter(/databases/$(database)/documents/users/$(uid)).data;
+      return profile.role == 'org_admin' && profile.orgId == orgId;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role in ['user', 'org_admin']
+        && (
+          request.resource.data.role == 'user'
+          || (
+            request.resource.data.email == request.auth.token.email
+            && !publicDomain(request.resource.data.email)
+            && existsAfter(/databases/$(database)/documents/organizations/$(request.resource.data.orgId))
+            && getAfter(/databases/$(database)/documents/organizations/$(request.resource.data.orgId)).data.adminUid == uid
+          )
+        );
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joinedOrgs']);
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    match /organizations/{orgId} {
+      allow read: if true;
+      allow create: if signedIn()
+        && request.resource.data.adminUid == request.auth.uid
+        && request.resource.data.officialEmail == request.auth.token.email
+        && request.resource.data.status == 'pending'
+        && request.resource.data.verificationStatus == 'pending'
+        && request.resource.data.joinCode.matches('^[A-Z0-9]{6}$')
+        && !publicDomain(request.resource.data.officialEmail)
+        && existsAfter(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode))
+        && getAfter(/databases/$(database)/documents/joinCodes/$(request.resource.data.joinCode)).data.ownerUid == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/orgSlugs/$(request.resource.data.slug))
+        && getAfter(/databases/$(database)/documents/orgSlugs/$(request.resource.data.slug)).data.ownerUid == request.auth.uid
+        && validOrgAdminProfile(request.auth.uid, orgId);
+      allow update: if isVerifiedOrgAdmin()
+        && resource.data.adminUid == request.auth.uid;
+      allow delete: if isVerifiedOrgAdmin()
+        && resource.data.adminUid == request.auth.uid;
+
+      match /appointments/{appointmentId} {
+        allow read: if signedIn()
+          && (resource.data.userId == request.auth.uid
+            || isVerifiedOrgAdmin());
+        allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if signedIn()
+          && (resource.data.userId == request.auth.uid
+            || isVerifiedOrgAdmin());
+      }
+
+      match /queue/{tokenId} {
+        allow read: if signedIn();
+        allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+        allow update, delete: if isVerifiedOrgAdmin();
+      }
+    }
+
+    match /joinCodes/{code} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && code.matches('^[A-Z0-9]{6}$')
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.orgId == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/organizations/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/organizations/$(request.auth.uid)).data.joinCode == code
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'org_admin';
+      allow update, delete: if false;
+    }
+
+    match /orgSlugs/{slug} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.orgId == request.auth.uid
+        && request.resource.data.slug == slug
+        && existsAfter(/databases/$(database)/documents/organizations/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/organizations/$(request.auth.uid)).data.slug == slug
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'org_admin';
+      allow update, delete: if false;
+    }
+  }
+}

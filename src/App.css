@@ -239,6 +239,11 @@ select.button { appearance: auto; }
 .app-nav { display: flex; align-items: center; gap: 18px; }
 .app-nav a { color: var(--text); text-decoration: none; font-size: 14px; font-weight: 700; }
 .app-nav .button.primary { color: #fff; }
+.app-context { min-width: 0; max-width: 230px; display: flex; flex-direction: column; gap: 3px; padding-right: 14px; border-right: 1px solid var(--border); }
+.app-context strong, .app-context small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-context strong { font-size: 13px; }
+.app-context small { color: var(--text-secondary); font-size: 11px; }
+.header-error { position: absolute; top: 100%; right: 24px; max-width: min(440px, calc(100vw - 32px)); margin: 8px 0 0; padding: 10px 12px; border: 1px solid var(--error); border-radius: 8px; background: var(--surface); color: var(--error); box-shadow: var(--shadow); font-size: 12px; }
 .landing-shell { min-height: 100vh; }
 .hero { max-width: 1120px; margin: 0 auto; padding: 100px 32px 72px; }
 .hero h1 { max-width: 760px; margin: 12px 0 18px; font-size: clamp(44px, 7vw, 76px); line-height: .98; letter-spacing: -4px; }
@@ -274,6 +279,23 @@ select.button { appearance: auto; }
 .service-row { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-top: 1px solid var(--border); }
 .service-row div { display: flex; flex-direction: column; gap: 5px; }
 .service-row small { color: var(--text-secondary); }
+.booking-form, .service-form { display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid var(--border); }
+.booking-form h3, .appointment-list h3 { margin: 4px 0; font-size: 14px; }
+.booking-form label, .service-form label { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 12px; font-weight: 700; }
+.booking-form input, .booking-form select, .service-form input { width: 100%; min-width: 0; height: 38px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); }
+.booking-form .muted, .service-management > .muted { margin: 0; font-size: 12px; }
+.form-success { margin: 10px 0 0; color: var(--success); font-size: 13px; }
+.service-management { margin-top: 14px; padding: 20px; }
+.service-management .section-heading h2 { margin: 0; }
+.scheduled-appointment-management { margin-top: 14px; padding: 20px; }
+.scheduled-appointment-management .section-heading h2 { margin: 0; }
+.scheduled-appointment-management .queue-select-label input { min-width: 180px; height: 36px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 13px; }
+.scheduled-appointment-row { margin-top: 10px; }
+.scheduled-appointment-row .appointment-actions { flex-wrap: wrap; justify-content: flex-end; }
+.service-form { grid-template-columns: 2fr 1fr auto; align-items: end; margin-top: 14px; }
+.service-actions, .appointment-actions { display: flex; align-items: center; gap: 8px; }
+.appointment-actions .button { min-height: 34px; }
+.appointment-history { margin-top: 28px; }
 .live-token-panel { text-align: center; }
 .large-token { display: block; margin: 28px 0 10px; color: var(--primary); font-size: 64px; }
 .live-token-panel .button { width: 100%; margin-top: 16px; }
@@ -293,16 +315,58 @@ select.button { appearance: auto; }
 .copy-row { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 6px 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); }
 .copy-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .marketing-page { max-width: 1120px; margin: 0 auto; padding: 100px 32px; }
+.app-error-boundary { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; text-align: center; }
+.app-error-boundary h1, .app-error-boundary p { margin: 0; }
+.app-error-boundary p { color: var(--text-secondary); }
+.app-error-boundary .button { margin-top: 8px; }
+.queue-management { margin-bottom: 14px; padding: 18px 20px; }
+.queue-management .section-heading { align-items: center; gap: 16px; }
+.queue-management h2 { margin: 3px 0 0; font-size: 17px; }
+.queue-select-label { display: flex; flex-direction: column; gap: 5px; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
+.queue-select-label select { min-width: 180px; height: 36px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 13px; }
+.queue-description { margin: 9px 0 0; color: var(--text-secondary); font-size: 12px; }
+.queue-description-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.queue-description-row .queue-description { min-width: 0; }
+.queue-description small { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 10px; }
+.queue-status-button { flex: 0 0 auto; height: 34px; }
+.create-queue-form { display: grid; grid-template-columns: 1fr 1.3fr auto; align-items: end; gap: 10px; margin-top: 14px; }
+.create-queue-form label { display: flex; flex-direction: column; gap: 5px; color: var(--text-secondary); font-size: 11px; font-weight: 700; }
+.create-queue-form input { width: 100%; height: 36px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text); font-size: 13px; }
+.dashboard-cards { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+.dashboard-cards .panel { padding: 18px 20px; }
+.live-queue-panel { min-width: 0; }
+.live-queue-panel > .section-heading h2 { margin: 0; }
+.live-queue-panel .queue-row { min-height: 54px; }
+.live-queue-panel .queue-row > strong { color: var(--primary); }
+.live-queue-panel > .button { margin-top: 12px; }
+.user-queue-select { align-items: center; margin: 16px 0 8px; }
+.user-queue-select select { width: 100%; min-width: 0; }
+.live-token-panel .queue-description { margin: 8px 0 0; }
+.queue-summary-stats { display: flex; justify-content: center; gap: 22px; margin: 12px 0; color: var(--text-secondary); font-size: 12px; }
+.queue-summary-stats strong { color: var(--text); }
 
 @media (max-width: 720px) {
   .app-header { height: 64px; padding: 0 16px; }
   .app-nav { gap: 8px; }
   .app-nav a:not(.button) { display: none; }
+  .app-context { max-width: 110px; padding-right: 8px; }
+  .app-context strong { font-size: 11px; }
+  .app-context small { display: none; }
+  .app-nav .button { height: 36px; padding: 0 9px; font-size: 12px; }
   .hero { padding: 72px 16px 48px; }
   .hero h1 { letter-spacing: -2px; }
   .hero-actions { flex-direction: column; }
   .hero-actions .button { width: 100%; }
   .feature-grid, .join-grid, .organization-grid, .dashboard-cards { grid-template-columns: 1fr; }
+  .create-queue-form { grid-template-columns: 1fr; }
+  .service-form { grid-template-columns: 1fr; }
+  .service-row, .appointment-row { align-items: flex-start; gap: 10px; }
+  .service-actions, .appointment-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .appointment-actions { align-items: flex-end; flex-direction: column; }
+  .queue-management { padding: 16px; }
+  .queue-management .section-heading { align-items: flex-start; flex-direction: column; }
+  .queue-select-label, .queue-select-label select { width: 100%; }
+  .queue-description-row { align-items: flex-start; flex-direction: column; }
   .feature-grid { padding: 0 16px 40px; }
   .page-shell { padding: 28px 16px 40px; }
   .auth-card { padding: 20px; }

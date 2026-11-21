@@ -16,7 +16,7 @@ export default function App() {
       <Route path="/login" element={<AuthPage mode="login" />} />
       <Route path="/register" element={<AuthPage mode="register" />} />
 
-      <Route element={<ProtectedRoute />}>
+      <Route element={<ProtectedRoute userOnly />}>
         <Route path="/join" element={<JoinPage />} />
         <Route path="/org/:orgSlug" element={<OrganizationPage />} />
         <Route path="/my-appointments" element={<AppointmentsPage />} />

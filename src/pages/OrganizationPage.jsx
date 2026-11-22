@@ -7,6 +7,10 @@ import { useAuth } from '../context/useAuth.js'
 import { formatTokenNumber, joinQueue } from '../queues.js'
 import { getAvailableTimeSlots, getLocalDateKey, isTokenForDate, isValidDateKey } from '../dates.js'
 
+function getErrorMessage(error, fallback) {
+  return typeof error?.message === 'string' && error.message.trim() ? error.message : fallback
+}
+
 export default function OrganizationPage() {
   const { orgSlug } = useParams()
   const { firebaseUser } = useAuth()
@@ -35,7 +39,7 @@ export default function OrganizationPage() {
         }
       })
       .catch((requestError) => {
-        if (active) setResult({ orgSlug, error: requestError.message })
+        if (active) setResult({ orgSlug, error: getErrorMessage(requestError, 'Could not load this organization.') })
       })
     return () => { active = false }
   }, [orgSlug])
@@ -49,7 +53,7 @@ export default function OrganizationPage() {
         const nextQueues = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
         setQueueState({ organizationId, queues: nextQueues })
       },
-      (requestError) => setQueueError(requestError.message),
+      (requestError) => setQueueError(getErrorMessage(requestError, 'Could not load the organization queues.')),
     )
   }, [organizationId])
 
@@ -68,7 +72,7 @@ export default function OrganizationPage() {
         tokens: snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
           .sort((left, right) => left.tokenNumber - right.tokenNumber),
       }),
-      (requestError) => setQueueError(requestError.message),
+      (requestError) => setQueueError(getErrorMessage(requestError, 'Could not load the selected queue tokens.')),
     )
   }, [organizationId, activeQueueId, tokenStateKey])
 
@@ -115,7 +119,15 @@ export default function OrganizationPage() {
     : []
 
   const joinSelectedQueue = async () => {
-    if (!selectedQueue || currentToken) return
+    if (currentToken) return
+    if (!organization?.id || !selectedQueue?.id) {
+      setQueueError('Choose an available organization queue before joining.')
+      return
+    }
+    if (!firebaseUser?.uid) {
+      setQueueError('Sign in before joining a queue.')
+      return
+    }
     setBusy(true)
     setQueueError('')
     try {
@@ -124,20 +136,23 @@ export default function OrganizationPage() {
         serviceName: selectedQueue.name,
       })
     } catch (requestError) {
-      setQueueError(requestError.message)
+      setQueueError(getErrorMessage(requestError, 'Could not join this queue. Please try again.'))
     } finally {
       setBusy(false)
     }
   }
 
   const leaveQueue = async () => {
-    if (!currentToken) return
+    if (!organization?.id || !selectedQueue?.id || !currentToken?.id) {
+      setQueueError('The queue token is no longer available. Refresh the page and try again.')
+      return
+    }
     setBusy(true)
     setQueueError('')
     try {
       await updateDoc(doc(db, 'organizations', organization.id, 'queues', selectedQueue.id, 'tokens', currentToken.id), { status: 'cancelled' })
     } catch (requestError) {
-      setQueueError(requestError.message)
+      setQueueError(getErrorMessage(requestError, 'Could not update this queue token. Please try again.'))
     } finally {
       setBusy(false)
     }
@@ -145,7 +160,22 @@ export default function OrganizationPage() {
 
   const bookService = async (event) => {
     event.preventDefault()
-    if (!bookingService || !bookingQueue) return
+    if (!organization?.id) {
+      setBookingError('This organization is no longer available. Refresh the page and try again.')
+      return
+    }
+    if (!bookingService) {
+      setBookingError('Choose an available service before booking.')
+      return
+    }
+    if (!bookingQueue?.id || !queues.some((queue) => queue.id === bookingQueue.id)) {
+      setBookingError('Choose an available queue for this booking.')
+      return
+    }
+    if (!firebaseUser?.uid) {
+      setBookingError('Sign in before confirming a booking.')
+      return
+    }
     setBusy(true)
     setBookingError('')
     setBookingNotice('')
@@ -173,7 +203,7 @@ export default function OrganizationPage() {
       setBookingServiceId('')
       setBookingTime('')
     } catch (requestError) {
-      setBookingError(requestError.message)
+      setBookingError(getErrorMessage(requestError, 'Could not complete this booking. Please try again.'))
     } finally {
       setBusy(false)
     }

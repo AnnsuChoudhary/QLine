@@ -4,13 +4,16 @@ import { BrowserRouter } from 'react-router-dom'
 import './index.css'
 import App from './App.jsx'
 import { AuthProvider } from './context/AuthContext.jsx'
+import AppErrorBoundary from './components/AppErrorBoundary.jsx'
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
     <BrowserRouter>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
+      <AppErrorBoundary>
+        <AuthProvider>
+          <App />
+        </AuthProvider>
+      </AppErrorBoundary>
     </BrowserRouter>
   </StrictMode>,
 )

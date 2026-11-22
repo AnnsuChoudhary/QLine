@@ -83,16 +83,18 @@ export default function AuthPage({ mode }) {
   const [category, setCategory] = useState(categories[0])
   const [address, setAddress] = useState('')
   const [registrationId, setRegistrationId] = useState('')
+  const [pendingOrganization, setPendingOrganization] = useState(null)
   const [error, setError] = useState(location.state?.verificationRequired ? 'Verify your email before opening the organization dashboard.' : '')
-  const [notice, setNotice] = useState(
-    location.state?.verificationRequired && firebaseUser
-      ? `Verify your email before opening the organization dashboard. A link was sent to ${firebaseUser.email}.`
-      : '',
-  )
+  const [notice, setNotice] = useState('')
   const [verificationUser, setVerificationUser] = useState(
     location.state?.verificationRequired ? firebaseUser : null,
   )
   const [busy, setBusy] = useState(false)
+  const routeVerificationUser = location.state?.verificationRequired ? firebaseUser : null
+  const activeVerificationUser = verificationUser || routeVerificationUser
+  const verificationNotice = notice || (routeVerificationUser
+    ? `Verify your email (check inbox/spam) and click "I've verified" to continue. Use Resend verification email if needed.`
+    : '')
 
   const emailDomain = email.trim().toLowerCase().split('@')[1]
   const publicDomainError = mode === 'register'
@@ -119,8 +121,8 @@ export default function AuthPage({ mode }) {
   const showVerificationPrompt = (user, linkSent = false) => {
     setVerificationUser(user)
     setNotice(linkSent
-      ? `We sent a verification link to ${user.email}. Verify your email before opening the organization dashboard.`
-      : `Verify your email before opening the organization dashboard. You can resend the link to ${user.email}.`)
+      ? `Verify your email (check inbox/spam) and click "I've verified" to continue. We sent a link to ${user.email}.`
+      : `Verify your email (check inbox/spam) and click "I've verified" to continue. Use Resend verification email if needed.`)
   }
 
   const submit = async (event) => {
@@ -136,7 +138,14 @@ export default function AuthPage({ mode }) {
     try {
       if (mode === 'login') {
         const credential = await signInWithEmailAndPassword(auth, email, password)
-        const profile = await ensureUserProfile(credential)
+        const existingProfile = await getDoc(doc(db, 'users', credential.user.uid))
+        if (!existingProfile.exists() && (role === 'organization' || location.state?.verificationRequired)) {
+          showVerificationPrompt(credential.user)
+          return
+        }
+        const profile = existingProfile.exists()
+          ? await refreshProfile(credential.user.uid)
+          : await ensureUserProfile(credential)
         if (profile?.role === 'org_admin') {
           if (!credential.user.emailVerified) {
             showVerificationPrompt(credential.user)
@@ -157,24 +166,13 @@ export default function AuthPage({ mode }) {
       await updateProfile(credential.user, { displayName: name.trim() })
 
       if (role === 'organization') {
-        const domain = email.trim().toLowerCase().split('@')[1]
-        const orgSlug = `${slugify(orgName) || 'organization'}-${credential.user.uid}`
-
-        await createOrganizationWithUniqueJoinCode(credential.user, {
+        setPendingOrganization({
           name: orgName.trim(),
-          slug: orgSlug,
-          adminUid: credential.user.uid,
-          officialEmail: email.trim().toLowerCase(),
-          domain,
+          officialEmail: credential.user.email,
           category,
           address: address.trim(),
           registrationId: registrationId.trim(),
-          status: 'pending',
-          verificationStatus: 'pending',
-          services: [],
-          hours: {},
         })
-        await refreshProfile(credential.user.uid)
         showVerificationPrompt(credential.user)
         await sendEmailVerification(credential.user)
         showVerificationPrompt(credential.user, true)
@@ -211,13 +209,13 @@ export default function AuthPage({ mode }) {
   }
 
   const resendVerification = async () => {
-    if (!verificationUser) return
+    if (!activeVerificationUser) return
     setBusy(true)
     setError('')
     setNotice('')
     try {
-      await sendEmailVerification(verificationUser)
-      setNotice(`A new verification link was sent to ${verificationUser.email}.`)
+      await sendEmailVerification(activeVerificationUser)
+      setNotice(`Verify your email (check inbox/spam) and click "I've verified" to continue. A new link was sent to ${activeVerificationUser.email}.`)
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -226,17 +224,41 @@ export default function AuthPage({ mode }) {
   }
 
   const checkVerification = async () => {
-    if (!verificationUser) return
+    if (!activeVerificationUser) return
     setBusy(true)
     setError('')
     try {
-      await reload(verificationUser)
-      if (!verificationUser.emailVerified) {
-        setError('Your email is not verified yet. Open the link in your inbox, then try again.')
+      await reload(activeVerificationUser)
+      if (!activeVerificationUser.emailVerified) {
+        setError('Your email is not verified yet. Check your inbox and spam folder, open the verification link, then try again.')
         return
       }
-      setNotice('Email verified. Opening your organization dashboard…')
-      navigate('/dashboard')
+      await activeVerificationUser.getIdToken(true)
+      if (pendingOrganization) {
+        const domain = pendingOrganization.officialEmail.split('@')[1]
+        const orgSlug = `${slugify(pendingOrganization.name) || 'organization'}-${activeVerificationUser.uid}`
+        await createOrganizationWithUniqueJoinCode(activeVerificationUser, {
+          ...pendingOrganization,
+          slug: orgSlug,
+          adminUid: activeVerificationUser.uid,
+          domain,
+          status: 'pending',
+          verificationStatus: 'pending',
+          services: [],
+          hours: {},
+        })
+        await refreshProfile(activeVerificationUser.uid)
+        setPendingOrganization(null)
+        setNotice('')
+        navigate('/dashboard')
+        return
+      }
+      const profile = await refreshProfile(activeVerificationUser.uid)
+      if (profile?.role === 'org_admin') {
+        navigate('/dashboard')
+        return
+      }
+      setError('Your email is verified, but organization setup is incomplete. Return to the registration page to finish setup.')
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -251,11 +273,11 @@ export default function AuthPage({ mode }) {
         <div className="auth-card">
           <p className="eyebrow">{mode === 'register' ? 'CREATE YOUR ACCOUNT' : 'WELCOME BACK'}</p>
           <h1>{mode === 'register' ? 'Join QLine' : 'Sign in to QLine'}</h1>
-          <div className="role-toggle" role="tablist" aria-label="Account role">
+          {!pendingOrganization && <div className="role-toggle" role="tablist" aria-label="Account role">
             <button type="button" className={role === 'user' ? 'active' : ''} onClick={() => { setRole('user'); setError('') }}>Customer / User</button>
             <button type="button" className={role === 'organization' ? 'active' : ''} onClick={() => { setRole('organization'); setError('') }}>Organization Admin</button>
-          </div>
-          <form className="auth-form" onSubmit={submit}>
+          </div>}
+          {!pendingOrganization && <form className="auth-form" onSubmit={submit}>
             {mode === 'register' && <label>Your name<input required value={name} onChange={(event) => setName(event.target.value)} /></label>}
             <label>Email address<input type="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
             {publicDomainError && <p className="form-error" role="alert">{publicDomainError}</p>}
@@ -269,12 +291,12 @@ export default function AuthPage({ mode }) {
               </>
             )}
             <button className="button primary" type="submit" disabled={busy || Boolean(publicDomainError)}>{busy ? 'Please wait…' : mode === 'register' ? 'Create account' : 'Sign in'}</button>
-          </form>
+          </form>}
           {role === 'user' && <button className="button google-button" type="button" disabled={busy} onClick={googleSignIn}>Continue with Google</button>}
-          {notice && (
+          {verificationNotice && (
             <div className="verification-prompt" role="status">
-              <p>{notice}</p>
-              {verificationUser && (
+              <p>{verificationNotice}</p>
+              {activeVerificationUser && (
                 <div className="verification-actions">
                   <button className="button secondary" type="button" disabled={busy} onClick={resendVerification}>Resend verification email</button>
                   <button className="button primary" type="button" disabled={busy} onClick={checkVerification}>I’ve verified my email</button>

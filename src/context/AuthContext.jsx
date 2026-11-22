@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { onAuthStateChanged } from 'firebase/auth'
+import { useCallback, useEffect, useState } from 'react'
+import { onIdTokenChanged } from 'firebase/auth'
 import { doc, getDoc } from 'firebase/firestore'
 import { auth, db } from '../firebase/config.js'
 import { AuthContext } from './AuthContext.js'
@@ -9,23 +9,43 @@ export function AuthProvider({ children }) {
   const [profile, setProfile] = useState(null)
   const [loading, setLoading] = useState(true)
 
-  useEffect(() => onAuthStateChanged(auth, async (user) => {
-    setFirebaseUser(user)
-    if (!user) {
-      setProfile(null)
-      setLoading(false)
-      return
+  useEffect(() => {
+    let active = true
+    let profileRequest = 0
+    let currentUid = null
+    const unsubscribe = onIdTokenChanged(auth, async (user) => {
+      const requestId = ++profileRequest
+      const nextUid = user?.uid || null
+      if (nextUid !== currentUid) {
+        currentUid = nextUid
+        setProfile(null)
+        setLoading(true)
+      }
+      setFirebaseUser(user)
+      if (!user) {
+        setLoading(false)
+        return
+      }
+      try {
+        const snapshot = await getDoc(doc(db, 'users', user.uid))
+        if (active && requestId === profileRequest) {
+          const nextProfile = snapshot.exists() ? snapshot.data() : null
+          setProfile(nextProfile && typeof nextProfile === 'object' ? nextProfile : null)
+        }
+      } catch (error) {
+        if (active && requestId === profileRequest) {
+          console.error('Failed to load the signed-in user profile.', error)
+          setProfile(null)
+        }
+      } finally {
+        if (active && requestId === profileRequest) setLoading(false)
+      }
+    })
+    return () => {
+      active = false
+      unsubscribe()
     }
-    try {
-      const snapshot = await getDoc(doc(db, 'users', user.uid))
-      setProfile(snapshot.exists() ? snapshot.data() : null)
-    } catch (error) {
-      console.error('Failed to load the signed-in user profile.', error)
-      setProfile(null)
-    } finally {
-      setLoading(false)
-    }
-  }), [])
+  }, [])
 
   const refreshProfile = useCallback(async (uid = firebaseUser?.uid) => {
     if (!uid) {
@@ -33,11 +53,11 @@ export function AuthProvider({ children }) {
       return null
     }
     const snapshot = await getDoc(doc(db, 'users', uid))
-    const nextProfile = snapshot.exists() ? snapshot.data() : null
+    const data = snapshot.exists() ? snapshot.data() : null
+    const nextProfile = data && typeof data === 'object' ? data : null
     setProfile(nextProfile)
     return nextProfile
   }, [firebaseUser?.uid])
 
-  const value = useMemo(() => ({ firebaseUser, profile, loading, refreshProfile }), [firebaseUser, profile, loading, refreshProfile])
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+  return <AuthContext.Provider value={{ firebaseUser, profile, loading, refreshProfile }}>{children}</AuthContext.Provider>
 }

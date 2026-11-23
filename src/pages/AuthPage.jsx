@@ -154,6 +154,10 @@ export default function AuthPage({ mode }) {
           navigate('/dashboard')
           return
         }
+        if (!credential.user.emailVerified) {
+          showVerificationPrompt(credential.user)
+          return
+        }
         navigate(getCustomerDestination(location, searchParams))
         return
       }
@@ -184,7 +188,9 @@ export default function AuthPage({ mode }) {
           joinedOrgs: [],
         })
         await refreshProfile(credential.user.uid)
-        navigate(getCustomerDestination(location, searchParams))
+        showVerificationPrompt(credential.user)
+        await sendEmailVerification(credential.user)
+        showVerificationPrompt(credential.user, true)
       }
     } catch (requestError) {
       setError(requestError.message)
@@ -258,7 +264,11 @@ export default function AuthPage({ mode }) {
         navigate('/dashboard')
         return
       }
-      setError('Your email is verified, but organization setup is incomplete. Return to the registration page to finish setup.')
+      if (profile?.role === 'user') {
+        navigate(getCustomerDestination(location, searchParams))
+        return
+      }
+      setError('Your email is verified, but account setup is incomplete. Return to registration to finish setup.')
     } catch (requestError) {
       setError(requestError.message)
     } finally {

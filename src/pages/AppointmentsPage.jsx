@@ -4,6 +4,7 @@ import { db } from '../firebase/config.js'
 import { useAuth } from '../context/useAuth.js'
 import AppHeader from '../components/AppHeader.jsx'
 import { getLocalDateKey, isAppointmentActive, isTokenForDate } from '../dates.js'
+import { updateQueueTokenStatus } from '../queues.js'
 
 function readAppointment(document) {
   const data = document.data()
@@ -28,7 +29,9 @@ function readQueueToken(document) {
 
   return {
     id: `${orgId}:${queueRef?.id || ''}:${document.id}`,
+    orgId,
     tokenNumber,
+    queueId: queueRef?.id || '',
     queueName,
     serviceName: typeof data?.serviceName === 'string' && data.serviceName.trim() ? data.serviceName : queueName,
     queueDate: typeof data?.queueDate === 'string' ? data.queueDate : '',
@@ -111,10 +114,11 @@ export default function AppointmentsPage() {
   }
 
   const cancelToken = async (token) => {
+    if (!window.confirm('Cancel this token? Repeated cancellations may pause future bookings with this organization.')) return
     setCancellingId(token.id)
     setResults((current) => ({ ...current, error: '' }))
     try {
-      await updateDoc(token.ref, { status: 'cancelled' })
+      await updateQueueTokenStatus(token.orgId, token.queueId, token.ref.id, 'cancelled')
     } catch (requestError) {
       console.error('Could not cancel queue token:', requestError)
       setResults((current) => ({ ...current, error: `Could not cancel queue token: ${requestError.message}` }))
@@ -141,6 +145,46 @@ export default function AppointmentsPage() {
       && ['waiting', 'serving'].includes(token.status))
   const historyTokens = (currentResults?.tokens || [])
     .filter((token) => !upcomingTokens.includes(token))
+  const cancelledAppointments = (currentResults?.appointments || []).filter((item) => item.status === 'cancelled')
+  const cancelledTokens = (currentResults?.tokens || []).filter((item) => item.status === 'cancelled')
+  const currentAppointments = activeAppointments.filter((item) => item.date === today)
+  const upcomingAppointments = activeAppointments.filter((item) => item.date > today)
+  const completedAppointments = historyAppointments.filter((item) => item.status !== 'cancelled')
+  const closedTokens = historyTokens.filter((item) => item.status !== 'cancelled')
+  const otherUpcomingTokens = upcomingTokens.filter((item) => !liveTokens.includes(item))
+  const [activeFilter, setActiveFilter] = useState('all')
+  const filterGroups = [
+    { id: 'all', label: 'All', count: currentAppointments.length + liveTokens.length + upcomingAppointments.length + otherUpcomingTokens.length + completedAppointments.length + closedTokens.length + cancelledAppointments.length + cancelledTokens.length },
+    { id: 'current', label: 'Current / Live', count: currentAppointments.length + liveTokens.length },
+    { id: 'upcoming', label: 'Upcoming / Scheduled', count: upcomingAppointments.length + otherUpcomingTokens.length },
+    { id: 'closed', label: 'Closed / Completed', count: completedAppointments.length + closedTokens.length },
+    { id: 'cancelled', label: 'Cancelled', count: cancelledAppointments.length + cancelledTokens.length },
+  ]
+
+  const renderToken = (token, canCancel = false) => (
+    <article className="panel appointment-row" key={token.id}>
+      <div><strong>{token.serviceName} · {token.tokenNumber}</strong><small>{token.queueDate || 'Today'}{token.timeSlot ? ` at ${token.timeSlot}` : ''} · {token.queueName}</small></div>
+      <div className="appointment-actions"><span className={`status-pill ${token.status}`}>{token.status === 'scheduled' ? 'Scheduled' : token.status}</span>{canCancel && <button className="button secondary" type="button" onClick={() => cancelToken(token)} disabled={Boolean(cancellingId)}>{cancellingId === token.id ? 'Cancelling…' : 'Cancel'}</button>}</div>
+    </article>
+  )
+
+  const renderAppointment = (appointment, canCancel = false) => {
+    const isPast = appointment.date < today
+    const status = isPast && ['booked', 'checked_in'].includes(appointment.status) ? 'completed' : appointment.status
+    const label = isPast && ['booked', 'checked_in'].includes(appointment.status)
+      ? 'Past'
+      : appointment.status === 'checked_in'
+        ? 'Checked in'
+        : appointment.status === 'booked'
+          ? 'Scheduled'
+          : appointment.status
+    return (
+      <article className="panel appointment-row" key={appointment.id}>
+        <div><strong>{appointment.serviceName}</strong><small>{appointment.date}{appointment.timeSlot ? ` at ${appointment.timeSlot}` : ''}</small></div>
+        <div className="appointment-actions"><span className={`status-pill ${status}`}>{label}</span>{canCancel && <button className="button secondary" type="button" onClick={() => cancelAppointment(appointment)} disabled={Boolean(cancellingId)}>{cancellingId === appointment.id ? 'Cancelling…' : 'Cancel booking'}</button>}</div>
+      </article>
+    )
+  }
 
   return (
     <main>
@@ -150,39 +194,51 @@ export default function AppointmentsPage() {
         {currentResults?.error && <p className="form-error" role="alert">{currentResults.error}</p>}
         {loading ? <p className="muted">Loading appointments and queue tokens…</p> : (
           <>
-            <section className="appointment-list">
-              <h2>Upcoming / scheduled</h2>
-              {upcomingTokens.length ? upcomingTokens.map((token) => <article className="panel appointment-row" key={token.id}>
-                <div><strong>{token.serviceName} · {token.tokenNumber}</strong><small>{token.queueDate || 'Today'}{token.timeSlot ? ` at ${token.timeSlot}` : ''} · {token.queueName}</small></div>
-                <div className="appointment-actions"><span className="status-pill">{token.status === 'scheduled' ? 'Scheduled' : token.status}</span><button className="button secondary" type="button" onClick={() => cancelToken(token)} disabled={Boolean(cancellingId)}>{cancellingId === token.id ? 'Cancelling…' : 'Cancel'}</button></div>
-              </article>) : <p className="muted">No upcoming queue tokens.</p>}
-              {activeAppointments.length ? activeAppointments.map((appointment) => <article className="panel appointment-row" key={appointment.id}>
-                <div><strong>{appointment.serviceName}</strong><small>{appointment.date}{appointment.timeSlot ? ` at ${appointment.timeSlot}` : ''}</small></div>
-                <div className="appointment-actions"><span className="status-pill">{appointment.status === 'checked_in' ? 'Checked in' : 'Scheduled'}</span><button className="button secondary" type="button" onClick={() => cancelAppointment(appointment)} disabled={Boolean(cancellingId)}>{cancellingId === appointment.id ? 'Cancelling…' : 'Cancel booking'}</button></div>
-              </article>) : upcomingTokens.length === 0 && <p className="muted">No upcoming appointments.</p>}
-            </section>
-            <section className="appointment-list">
-              <h2>Today’s live queue tokens</h2>
-              {liveTokens.length ? liveTokens.map((token) => <article className="panel appointment-row" key={token.id}>
-                <div><strong>{token.serviceName} · {token.tokenNumber}</strong><small>{token.timeSlot ? `Today at ${token.timeSlot}` : 'Live token for today'} · {token.queueName}</small></div><span className="status-pill">{token.status}</span>
-              </article>) : <p className="muted">No active live tokens today.</p>}
-            </section>
-            <section className="appointment-list appointment-history">
-              <h2>History</h2>
-              {historyAppointments.length > 0 && <div className="appointment-list">
-                <h3>Past and completed appointments</h3>
-                {historyAppointments.map((appointment) => <article className="panel appointment-row" key={appointment.id}>
-                  <div><strong>{appointment.serviceName}</strong><small>{appointment.date}{appointment.timeSlot ? ` at ${appointment.timeSlot}` : ''}</small></div><span className="status-pill">{appointment.status}</span>
-                </article>)}
-              </div>}
-              {historyTokens.length > 0 && <div className="appointment-list queue-token-list">
-                <h3>Past queue tokens</h3>
-                {historyTokens.map((token) => <article className="panel appointment-row" key={token.id}>
-                  <div><strong>{token.serviceName} · {token.tokenNumber}</strong><small>{token.queueDate || 'Past'}{token.timeSlot ? ` at ${token.timeSlot}` : ''} · {token.queueName}</small></div><span className="status-pill">{token.status}</span>
-                </article>)}
-              </div>}
-              {historyAppointments.length === 0 && historyTokens.length === 0 && <p className="muted">Completed, cancelled, and past items will appear here.</p>}
-            </section>
+            <nav className="appointment-filter-bar" aria-label="Filter appointments">
+              {filterGroups.map((group) => <button
+                type="button"
+                key={group.id}
+                className={activeFilter === group.id ? 'active' : ''}
+                aria-pressed={activeFilter === group.id}
+                onClick={() => setActiveFilter(group.id)}
+              >{group.label}<span>{group.count}</span></button>)}
+            </nav>
+            {activeFilter === 'all' ? (
+              <section className="appointment-list filtered-appointment-group">
+                <h2>Your bookings</h2>
+                {liveTokens.map((item) => renderToken(item))}
+                {currentAppointments.map((item) => renderAppointment(item, true))}
+                {otherUpcomingTokens.map((item) => renderToken(item, true))}
+                {upcomingAppointments.map((item) => renderAppointment(item, true))}
+                {closedTokens.map((item) => renderToken(item))}
+                {completedAppointments.map((item) => renderAppointment(item))}
+                {cancelledTokens.map((item) => renderToken(item))}
+                {cancelledAppointments.map((item) => renderAppointment(item))}
+                {!filterGroups[0].count && <p className="muted">Your upcoming appointments and queue tokens will appear here.</p>}
+              </section>
+            ) : (
+              <section className="appointment-list filtered-appointment-group">
+                <h2>{filterGroups.find((group) => group.id === activeFilter)?.label}</h2>
+                {activeFilter === 'current' && <>
+                  {liveTokens.map((item) => renderToken(item))}
+                  {currentAppointments.map((item) => renderAppointment(item, true))}
+                </>}
+                {activeFilter === 'upcoming' && <>
+                  {otherUpcomingTokens.map((item) => renderToken(item, true))}
+                  {upcomingAppointments.map((item) => renderAppointment(item, true))}
+                </>}
+                {activeFilter === 'closed' && <>
+                  {closedTokens.map((item) => renderToken(item))}
+                  {completedAppointments.map((item) => renderAppointment(item))}
+                </>}
+                {activeFilter === 'cancelled' && <>
+                  {cancelledTokens.map((item) => renderToken(item))}
+                  {cancelledAppointments.map((item) => renderAppointment(item))}
+                </>}
+                {filterGroups.find((group) => group.id === activeFilter)?.count === 0
+                  && <p className="muted">No {filterGroups.find((group) => group.id === activeFilter)?.label.toLowerCase()} items.</p>}
+              </section>
+            )}
           </>
         )}
       </section>

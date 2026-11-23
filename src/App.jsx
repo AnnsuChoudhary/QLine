@@ -7,6 +7,7 @@ import JoinPage from './pages/JoinPage.jsx'
 import OrganizationPage from './pages/OrganizationPage.jsx'
 import AppointmentsPage from './pages/AppointmentsPage.jsx'
 import DashboardPage from './pages/DashboardPage.jsx'
+import ProfilePage from './pages/ProfilePage.jsx'
 import NotFoundPage from './pages/NotFoundPage.jsx'
 
 export default function App() {
@@ -20,6 +21,10 @@ export default function App() {
         <Route path="/join" element={<JoinPage />} />
         <Route path="/org/:orgSlug" element={<OrganizationPage />} />
         <Route path="/my-appointments" element={<AppointmentsPage />} />
+      </Route>
+
+      <Route element={<ProtectedRoute />}>
+        <Route path="/profile" element={<ProfilePage />} />
       </Route>
 
       <Route element={<ProtectedRoute orgAdminOnly />}>

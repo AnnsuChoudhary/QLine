@@ -8,6 +8,12 @@ Node.js 22.13 or later (the API uses the built-in `node:sqlite` module).
 
 ## Development
 
+Copy `.env.example` to `.env` and configure the six required `VITE_FIREBASE_*`
+values for the Firebase-backed UI. `VITE_FIREBASE_MEASUREMENT_ID` is optional.
+The variables `PORT`, `DATABASE_PATH`, `BUSINESS_EMAILS`, `STAFF_EMAILS`, and
+`COOKIE_SECURE` configure the separate local SQLite API and are optional.
+`BUSINESS_EMAILS` and `STAFF_EMAILS` accept comma-separated email addresses.
+
 ```bash
 npm install
 npm run dev
@@ -51,7 +57,18 @@ organization admins can require an email domain and admission ID, employee ID,
 or department in the customer profile. Customers edit those fields on their
 Profile page. The client provides guidance, but Firestore rules enforce email,
 profile, account restriction, and booking-counter checks when tokens are
-created.
+created. Pipeline queue tokens are likewise authorized by Firestore rules so a
+customer can only enter the first step or continue after completing the prior
+step.
+
+Organization admins can create and publish sequential pipelines from the
+Dashboard’s **Workflows / Pipelines** section. A pipeline contains 2–20 existing
+queues; customers see each step and can only join the next queue after the
+previous token is completed. **Complete & Advance** unlocks the next step and
+provides a customer continuation link, while **Conclude / Stop Pipeline**
+closes a run early. Firestore rules validate the run and previous token on
+every pipeline token write. This workflow uses the Firebase organization model;
+the separate SQLite demo API does not have organization pipelines.
 
 Per account and organization, booking rules allow at most 3 active tokens per
 queue, 5 active tokens total, 5 tokens per queue per scheduled date, and 10

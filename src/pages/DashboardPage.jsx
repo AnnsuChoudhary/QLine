@@ -4,9 +4,12 @@ import { db } from '../firebase/config.js'
 import { useAuth } from '../context/useAuth.js'
 import AppHeader from '../components/AppHeader.jsx'
 import { getLocalDateKey, isTokenForDate, isTokenTimeDue } from '../dates.js'
-import { formatTokenNumber, updateQueueTokenStatus } from '../queues.js'
+import { concludePipelineRun, formatTokenNumber, updateQueueTokenStatus } from '../queues.js'
 import { BOOKING_PROFILE_FIELDS, emailDomainPattern } from '../bookingVerification.js'
 import { DEFAULT_BOOKING_INTEGRITY, removeActiveBookingFromLimits } from '../bookingLimits.js'
+import { validatePipelineDraft } from '../pipelines.js'
+
+const EMPTY_PIPELINES = []
 
 function readQueue(document) {
   const data = document.data()
@@ -16,6 +19,7 @@ function readQueue(document) {
     purpose: typeof data?.purpose === 'string' ? data.purpose : '',
     status: data?.status === 'open' ? 'open' : 'closed',
     activeDate: typeof data?.activeDate === 'string' ? data.activeDate : '',
+    pipelineIds: Array.isArray(data?.pipelineIds) ? data.pipelineIds.filter((id) => typeof id === 'string') : [],
   }
 }
 
@@ -31,6 +35,9 @@ function readToken(document) {
     timeSlot: typeof data?.timeSlot === 'string' ? data.timeSlot : '',
     serviceName: typeof data?.serviceName === 'string' ? data.serviceName : '',
     serviceId: typeof data?.serviceId === 'string' ? data.serviceId : '',
+    pipelineId: typeof data?.pipelineId === 'string' ? data.pipelineId : '',
+    pipelineRunId: typeof data?.pipelineRunId === 'string' ? data.pipelineRunId : '',
+    pipelineStep: Number.isSafeInteger(data?.pipelineStep) ? data.pipelineStep : 0,
     limitTracked: data?.limitTracked === true,
     createdAt: data?.createdAt,
     ref: document.ref,
@@ -54,7 +61,12 @@ export default function DashboardPage() {
   const { firebaseUser, profile } = useAuth()
   const [organization, setOrganization] = useState(null)
   const [queueState, setQueueState] = useState({ orgId: '', queues: [] })
+  const [pipelineState, setPipelineState] = useState({ orgId: '', pipelines: [] })
+  const [readyPipelineRuns, setReadyPipelineRuns] = useState({ orgId: '', runs: [] })
   const [selectedQueueId, setSelectedQueueId] = useState('')
+  const [selectedPipelineId, setSelectedPipelineId] = useState('')
+  const [pipelineName, setPipelineName] = useState('')
+  const [pipelineQueueIds, setPipelineQueueIds] = useState([])
   const [tokenState, setTokenState] = useState({ queueId: '', tokens: [] })
   const [dateTokenState, setDateTokenState] = useState({ queueId: '', date: '', tokens: [] })
   const [restrictionState, setRestrictionState] = useState({ orgId: '', userIds: new Set() })
@@ -116,13 +128,48 @@ export default function DashboardPage() {
         setError(`Could not read the organization queues: ${requestError.message}`)
       }
     }, (requestError) => setError(requestError.message))
+    const unsubscribePipelines = onSnapshot(
+      collection(db, 'organizations', profile.orgId, 'pipelines'),
+      (snapshot) => setPipelineState({
+        orgId: profile.orgId,
+        pipelines: snapshot.docs.map((item) => ({ id: item.id, ...item.data() }))
+          .filter((pipeline) => typeof pipeline.name === 'string' && Array.isArray(pipeline.queueIds))
+          .sort((left, right) => left.name.localeCompare(right.name)),
+      }),
+      (requestError) => setError(`Could not read organization pipelines: ${requestError.message}`),
+    )
     return () => {
       active = false
       unsubscribe()
+      unsubscribePipelines()
     }
   }, [profile?.orgId])
 
   const queues = queueState.orgId === profile?.orgId ? queueState.queues : []
+  const pipelines = pipelineState.orgId === profile?.orgId ? pipelineState.pipelines : EMPTY_PIPELINES
+  const selectedPipeline = pipelines.find((pipeline) => pipeline.id === selectedPipelineId)
+  const pipelineRuns = readyPipelineRuns.orgId === profile?.orgId ? readyPipelineRuns.runs : []
+
+  useEffect(() => {
+    if (!profile?.orgId || !pipelines.length) return undefined
+    const unsubscribeRuns = pipelines.map((pipeline) => onSnapshot(
+      query(
+        collection(db, 'organizations', profile.orgId, 'pipelines', pipeline.id, 'runs'),
+        where('status', '==', 'ready'),
+      ),
+      (snapshot) => setReadyPipelineRuns((current) => ({
+        orgId: profile.orgId,
+        runs: [
+          ...(current.orgId === profile.orgId
+            ? current.runs.filter((run) => run.pipelineId !== pipeline.id)
+            : []),
+          ...snapshot.docs.map((item) => ({ id: item.id, pipelineId: pipeline.id, ...item.data() })),
+        ],
+      })),
+      (requestError) => setError(`Could not read ready pipeline runs: ${requestError.message}`),
+    ))
+    return () => unsubscribeRuns.forEach((unsubscribe) => unsubscribe())
+  }, [profile?.orgId, pipelines])
   const activeQueueId = queues.some((item) => item.id === selectedQueueId) ? selectedQueueId : queues[0]?.id || ''
   const restrictedUserIds = restrictionState.orgId === profile?.orgId ? restrictionState.userIds : new Set()
 
@@ -263,6 +310,7 @@ export default function DashboardPage() {
       await setDoc(queueRef, {
         name,
         purpose: queuePurpose.trim(),
+        pipelineIds: [],
         status: 'open',
         nextTokenNumber: 1,
         lastIssuedTokenId: '',
@@ -280,6 +328,129 @@ export default function DashboardPage() {
     }
   }
 
+  const startNewPipeline = () => {
+    setSelectedPipelineId('')
+    setPipelineName('')
+    setPipelineQueueIds([])
+    setError('')
+  }
+
+  const editPipeline = (pipelineId) => {
+    const pipeline = pipelines.find((item) => item.id === pipelineId)
+    if (!pipeline) return
+    setSelectedPipelineId(pipelineId)
+    setPipelineName(pipeline.name)
+    setPipelineQueueIds([...pipeline.queueIds])
+    setError('')
+  }
+
+  const savePipeline = async (event) => {
+    event.preventDefault()
+    let draft
+    try {
+      draft = validatePipelineDraft(pipelineName, pipelineQueueIds, queues)
+    } catch (validationError) {
+      setError(validationError.message)
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const pipelineId = selectedPipelineId || crypto.randomUUID()
+      const pipelineRef = doc(db, 'organizations', profile.orgId, 'pipelines', pipelineId)
+      const isExisting = pipelines.some((pipeline) => pipeline.id === pipelineId)
+      const nextPipelines = pipelines
+        .filter((pipeline) => pipeline.id !== pipelineId)
+        .concat([{
+          id: pipelineId,
+          ...draft,
+          published: isExisting && selectedPipeline?.published === true,
+        }])
+      const queueMembership = new Map(queues.map((queue) => [queue.id, []]))
+      nextPipelines.filter((pipeline) => pipeline.published).forEach((pipeline) => {
+        pipeline.queueIds.forEach((queueId) => {
+          const memberships = queueMembership.get(queueId)
+          if (memberships && !memberships.includes(pipeline.id)) memberships.push(pipeline.id)
+        })
+      })
+      const batch = writeBatch(db)
+      const pipelineData = {
+        ...draft,
+        published: isExisting && selectedPipeline?.published === true,
+        updatedAt: serverTimestamp(),
+      }
+      if (isExisting) batch.update(pipelineRef, pipelineData)
+      else batch.set(pipelineRef, { ...pipelineData, createdAt: serverTimestamp() })
+      queues.forEach((queue) => {
+        batch.update(doc(db, 'organizations', profile.orgId, 'queues', queue.id), {
+          pipelineIds: queueMembership.get(queue.id) || [],
+        })
+      })
+      await batch.commit()
+      setSelectedPipelineId(pipelineId)
+      setPipelineName(draft.name)
+      setPipelineQueueIds(draft.queueIds)
+    } catch (requestError) {
+      setError(`Could not save pipeline: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const setPipelinePublished = async (pipeline, published) => {
+    setBusy(true)
+    setError('')
+    try {
+      const nextPipelines = pipelines.map((item) => item.id === pipeline.id ? { ...item, published } : item)
+      const queueMembership = new Map(queues.map((queue) => [queue.id, []]))
+      nextPipelines.filter((item) => item.published).forEach((item) => {
+        item.queueIds.forEach((queueId) => {
+          const memberships = queueMembership.get(queueId)
+          if (memberships && !memberships.includes(item.id)) memberships.push(item.id)
+        })
+      })
+      const batch = writeBatch(db)
+      batch.update(doc(db, 'organizations', profile.orgId, 'pipelines', pipeline.id), {
+        published,
+        updatedAt: serverTimestamp(),
+      })
+      queues.forEach((queue) => {
+        batch.update(doc(db, 'organizations', profile.orgId, 'queues', queue.id), {
+          pipelineIds: queueMembership.get(queue.id) || [],
+        })
+      })
+      await batch.commit()
+    } catch (requestError) {
+      setError(`Could not ${published ? 'publish' : 'unpublish'} pipeline: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const completePipelineStep = async (token) => {
+    setBusy(true)
+    setError('')
+    try {
+      await updateQueueTokenStatus(profile.orgId, activeQueueId, token.id, 'completed')
+    } catch (requestError) {
+      setError(`Could not complete and advance the pipeline token: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stopPipeline = async (token) => {
+    setBusy(true)
+    setError('')
+    try {
+      await concludePipelineRun(profile.orgId, token.pipelineId, token.pipelineRunId)
+    } catch (requestError) {
+      setError(`Could not stop the pipeline: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const callNext = async () => {
     if (!activeQueueId) return
     setBusy(true)
@@ -288,6 +459,9 @@ export default function DashboardPage() {
       const current = activeTokens.find((item) => item.status === 'serving')
       const next = activeTokens.find((item) => item.status === 'waiting')
       if (!current && !next) throw new Error('There are no waiting tokens in this queue.')
+      if (current?.pipelineRunId) {
+        throw new Error('Use Complete & Advance for a pipeline token so its next step is unlocked safely.')
+      }
 
       const currentRef = current?.ref || null
       const nextRef = next?.ref || null
@@ -571,7 +745,7 @@ export default function DashboardPage() {
     <main>
       <AppHeader />
       <section className="page-shell">
-        <div className="page-heading"><div><p className="eyebrow">ORGANIZATION ADMIN</p><h1>{organization?.name || 'Dashboard'}</h1></div>{organization?.verificationStatus === 'pending' && <span className="status-pill warning">Verification pending</span>}</div>
+        <div className="page-heading"><div><p className="eyebrow">{organization?.category || 'ORGANIZATION ADMIN'}</p><h1>{organization?.name || 'Dashboard'}</h1></div>{organization?.verificationStatus === 'pending' && <span className="status-pill warning">Verification pending</span>}</div>
         <section className="panel queue-management">
           <div className="section-heading">
             <div><p className="eyebrow">QUEUE MANAGEMENT</p><h2>Queues & counters</h2></div>
@@ -588,10 +762,49 @@ export default function DashboardPage() {
             <button className="button secondary" type="submit" disabled={busy}>{busy ? 'Saving…' : 'Add queue'}</button>
           </form>
         </section>
+        <section className="panel pipeline-management">
+          <div className="section-heading">
+            <div><p className="eyebrow">WORKFLOWS / PIPELINES</p><h2>Sequential queue pipelines</h2></div>
+            <button className="button secondary" type="button" onClick={startNewPipeline} disabled={busy}>New pipeline</button>
+          </div>
+          <p className="muted">Chain at least two existing queues in the order customers should visit. Only the first step is joinable until the previous step is completed.</p>
+          {pipelines.map((pipeline) => <article className="service-row" key={pipeline.id}>
+            <div><strong>{pipeline.name}</strong><small>{pipeline.queueIds.map((queueId) => queues.find((queueItem) => queueItem.id === queueId)?.name || 'Unavailable queue').join(' → ')} · {pipeline.published ? 'Published' : 'Unpublished'}</small></div>
+            <div className="service-actions">
+              <button className="button secondary" type="button" onClick={() => editPipeline(pipeline.id)} disabled={busy}>Edit</button>
+              <button className="button secondary" type="button" onClick={() => setPipelinePublished(pipeline, !pipeline.published)} disabled={busy}>{pipeline.published ? 'Unpublish' : 'Publish'}</button>
+            </div>
+          </article>)}
+          {!pipelines.length && <p className="muted">No pipelines have been created.</p>}
+          <form className="pipeline-form" onSubmit={savePipeline}>
+            <label>Pipeline name<input value={pipelineName} onChange={(event) => setPipelineName(event.target.value)} placeholder="e.g. Campus Hiring Drive" required /></label>
+            <label>Add queue step
+              <select value="" onChange={(event) => {
+                if (event.target.value && !pipelineQueueIds.includes(event.target.value)) {
+                  setPipelineQueueIds((current) => [...current, event.target.value])
+                }
+              }} disabled={!queues.length}>
+                <option value="">Choose an existing queue</option>
+                {queues.filter((item) => !pipelineQueueIds.includes(item.id)).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </select>
+            </label>
+            <ol className="pipeline-step-list">
+              {pipelineQueueIds.map((queueId, index) => <li key={`${queueId}-${index}`}>
+                <span><strong>Step {index + 1}</strong> · {queues.find((item) => item.id === queueId)?.name || 'Unavailable queue'}</span>
+                <div>
+                  <button className="button secondary" type="button" aria-label={`Move step ${index + 1} up`} onClick={() => setPipelineQueueIds((current) => current.map((id, position) => position === index - 1 ? current[index] : position === index ? current[index - 1] : id))} disabled={busy || index === 0}>Move up</button>
+                  <button className="button secondary" type="button" aria-label={`Move step ${index + 1} down`} onClick={() => setPipelineQueueIds((current) => current.map((id, position) => position === index ? current[index + 1] : position === index + 1 ? current[index] : id))} disabled={busy || index === pipelineQueueIds.length - 1}>Move down</button>
+                  <button className="button secondary" type="button" onClick={() => setPipelineQueueIds((current) => current.filter((_, position) => position !== index))} disabled={busy}>Remove</button>
+                </div>
+              </li>)}
+            </ol>
+            <button className="button primary" type="submit" disabled={busy || !organization}>{busy ? 'Saving…' : selectedPipelineId ? 'Save pipeline' : 'Create pipeline'}</button>
+          </form>
+        </section>
         <div className="dashboard-cards">
           <section className="panel live-queue-panel">
             <div className="section-heading"><h2>Live queue · Today</h2>{selectedQueue && <span className="status-pill">{selectedQueue.name}</span>}</div>
-            {activeTokens.length ? activeTokens.slice(0, 5).map((token) => <div className="queue-row" key={token.id}><strong>{formatTokenNumber(token.tokenNumber)}</strong><span>{token.userName}<small>{token.serviceName || selectedQueue?.name}{token.timeSlot ? ` · ${token.timeSlot}` : ''}</small></span><span className={`status-pill ${token.status}`}>{token.status}</span></div>) : <p className="muted">{selectedQueue ? 'No active queue tokens.' : 'Add a queue to start receiving tokens.'}</p>}
+            {activeTokens.length ? activeTokens.slice(0, 5).map((token) => <div className="queue-row" key={token.id}><strong>{formatTokenNumber(token.tokenNumber)}</strong><span>{token.userName}<small>{token.serviceName || selectedQueue?.name}{token.timeSlot ? ` · ${token.timeSlot}` : ''}{token.pipelineId ? ` · Pipeline step ${token.pipelineStep}` : ''}</small></span><span className={`status-pill ${token.status}`}>{token.status}</span>{token.pipelineRunId && token.status === 'serving' && <button className="button secondary" type="button" onClick={() => completePipelineStep(token)} disabled={busy}>{busy ? 'Updating…' : 'Complete & Advance'}</button>}</div>) : <p className="muted">{selectedQueue ? 'No active queue tokens.' : 'Add a queue to start receiving tokens.'}</p>}
             <button className="button primary" type="button" onClick={callNext} disabled={busy || !selectedQueue || !activeTokens.some((token) => token.status === 'waiting' || token.status === 'serving')}>{busy ? 'Updating…' : activeTokens.some((token) => token.status === 'waiting') ? 'Call next token' : 'Finish current token'}</button>
           </section>
           <section className="panel share-panel"><h2>Organization access</h2><label>Join code<div className="copy-row"><strong>{joinCode || '—'}</strong><button className="button secondary" type="button" onClick={() => copy(joinCode, 'code')} disabled={!joinCode}>{copied === 'code' ? 'Copied' : 'Copy'}</button></div></label><label>Shareable booking link<div className="copy-row"><span>{bookingLink || 'Not available'}</span><button className="button secondary" type="button" onClick={() => copy(bookingLink, 'link')} disabled={!bookingLink}>{copied === 'link' ? 'Copied' : 'Copy'}</button></div></label></section>
@@ -669,16 +882,31 @@ export default function DashboardPage() {
           {appointmentError && <p className="form-error" role="alert">{appointmentError}</p>}
           <div className="appointment-list queue-token-list">
             <h3>Queue tokens · {appointmentDate}</h3>
-            {dateTokens.length ? dateTokens.map((token) => <article className="panel appointment-row" key={token.id}>
+            {dateTokens.length ? dateTokens.map((token) => {
+              const pipeline = pipelines.find((item) => item.id === token.pipelineId)
+              const readyRun = pipelineRuns.find((run) => run.id === token.pipelineRunId
+                && run.pipelineId === token.pipelineId
+                && run.currentTokenId === token.id
+                && run.currentStep === token.pipelineStep)
+              const nextQueue = pipeline && queues.find((item) => item.id === pipeline.queueIds[token.pipelineStep])
+              const hasNextStep = Boolean(readyRun && nextQueue)
+              const continuationLink = bookingLink && token.pipelineId && token.pipelineRunId
+                ? `${bookingLink}?pipeline=${encodeURIComponent(token.pipelineId)}&run=${encodeURIComponent(token.pipelineRunId)}`
+                : ''
+              return <article className="panel appointment-row" key={token.id}>
               <div><strong>{token.serviceName || selectedQueue?.name || 'Queue'} · {formatTokenNumber(token.tokenNumber)}</strong><small>{token.queueDate}{token.timeSlot ? ` at ${token.timeSlot}` : ''}</small><small>Customer: {token.userName}</small></div>
               <div className="appointment-actions">
                 <span className={`status-pill ${token.status}`}>{token.status.replace('_', ' ')}</span>
+                {token.pipelineId && <small>Pipeline step {token.pipelineStep}</small>}
+                {token.pipelineRunId && token.status === 'completed' && hasNextStep && continuationLink && <button className="button secondary" type="button" onClick={() => copy(continuationLink, `pipeline-${token.id}`)}>{copied === `pipeline-${token.id}` ? 'Link copied' : `Copy link to ${nextQueue.name}`}</button>}
+                {token.pipelineRunId && token.status === 'completed' && hasNextStep && <button className="button secondary" type="button" onClick={() => stopPipeline(token)} disabled={busy}>{busy ? 'Updating…' : 'Conclude / Stop Pipeline'}</button>}
                 {['scheduled', 'waiting'].includes(token.status) && <button className="button secondary" type="button" onClick={() => markQueueTokenNoShow(token)} disabled={busy}>Mark no-show</button>}
                 {['scheduled', 'waiting', 'serving'].includes(token.status) && <button className="button secondary" type="button" onClick={() => cancelQueueToken(token)} disabled={busy}>Cancel token</button>}
                 <button className="button secondary" type="button" onClick={() => toggleBookingRestriction(token)} disabled={Boolean(restrictionBusyUid)}>{restrictionBusyUid === token.userId ? 'Updating…' : restrictedUserIds.has(token.userId) ? 'Restore bookings' : 'Restrict bookings'}</button>
                 {token.limitTracked && <button className="button secondary" type="button" onClick={() => resetBookingStrikes(token)} disabled={Boolean(restrictionBusyUid)}>{restrictionBusyUid === token.userId ? 'Updating…' : 'Reset repeat counts'}</button>}
               </div>
-            </article>) : <p className="muted">No queue tokens scheduled for this date and queue.</p>}
+            </article>
+            }) : <p className="muted">No queue tokens scheduled for this date and queue.</p>}
           </div>
           {!appointmentState.ready || appointmentState.orgId !== profile.orgId || appointmentState.date !== appointmentDate
             ? <p className="muted">Loading appointments for {appointmentDate}…</p>

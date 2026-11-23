@@ -127,6 +127,176 @@ service cloud.firestore {
       return /databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)/tokens/$(tokenId);
     }
 
+    function pipelinePath(orgId, pipelineId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/pipelines/$(pipelineId);
+    }
+
+    function pipelineRunPath(orgId, pipelineId, runId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/pipelines/$(pipelineId)/runs/$(runId);
+    }
+
+    function validPipelineTokenCreate(orgId, queueId, tokenId) {
+      let pipelineId = request.resource.data.pipelineId;
+      let runId = request.resource.data.pipelineRunId;
+      let step = request.resource.data.pipelineStep;
+      let pipeline = get(pipelinePath(orgId, pipelineId)).data;
+      let run = pipelineRunPath(orgId, pipelineId, runId);
+      let queueIds = pipeline.queueIds;
+      return pipelineId is string
+        && runId is string
+        && step is int
+        && exists(pipelinePath(orgId, pipelineId))
+        && queueIds is list
+        && queueIds.size() >= 2
+        && queueIds.size() <= 20
+        && pipeline.published == true
+        && step >= 1
+        && step <= queueIds.size()
+        && queueIds[step - 1] == queueId
+        && request.resource.data.previousTokenId is string
+        && existsAfter(run)
+        && getAfter(run).data.pipelineId == pipelineId
+        && getAfter(run).data.userId == request.auth.uid
+        && getAfter(run).data.currentStep == step
+        && getAfter(run).data.currentQueueId == queueId
+        && getAfter(run).data.currentTokenId == tokenId
+        && getAfter(run).data.status == 'active'
+        && (
+          (
+            step == 1
+            && request.resource.data.previousTokenId == ''
+            && !exists(run)
+          )
+          || (
+            step > 1
+            && exists(run)
+            && get(run).data.status == 'ready'
+            && get(run).data.currentStep == step - 1
+            && get(run).data.currentTokenId == request.resource.data.previousTokenId
+            && exists(queueTokenPath(orgId, queueIds[step - 2], request.resource.data.previousTokenId))
+            && get(queueTokenPath(orgId, queueIds[step - 2], request.resource.data.previousTokenId)).data.userId == request.auth.uid
+            && get(queueTokenPath(orgId, queueIds[step - 2], request.resource.data.previousTokenId)).data.pipelineRunId == runId
+            && get(queueTokenPath(orgId, queueIds[step - 2], request.resource.data.previousTokenId)).data.pipelineStep == step - 1
+            && get(queueTokenPath(orgId, queueIds[step - 2], request.resource.data.previousTokenId)).data.status == 'completed'
+          )
+        );
+    }
+
+    function validPipelineRunCreate(orgId, pipelineId, runId) {
+      let tokenId = request.resource.data.currentTokenId;
+      let token = queueTokenPath(orgId, request.resource.data.currentQueueId, tokenId);
+      let pipeline = get(pipelinePath(orgId, pipelineId)).data;
+      return request.resource.data.keys().hasOnly([
+          'pipelineId', 'userId', 'status', 'currentStep', 'currentQueueId',
+          'currentTokenId', 'steps', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.pipelineId == pipelineId
+        && request.resource.data.userId == request.auth.uid
+        && pipeline.published == true
+        && pipeline.queueIds is list
+        && pipeline.queueIds.size() >= 2
+        && request.resource.data.status == 'active'
+        && request.resource.data.currentStep == 1
+        && request.resource.data.currentQueueId == pipeline.queueIds[0]
+        && request.resource.data.steps is list
+        && request.resource.data.steps.size() == 1
+        && request.resource.data.steps[0].queueId == request.resource.data.currentQueueId
+        && request.resource.data.steps[0].tokenId == tokenId
+        && existsAfter(token)
+        && getAfter(token).data.userId == request.auth.uid
+        && getAfter(token).data.pipelineId == pipelineId
+        && getAfter(token).data.pipelineRunId == runId
+        && getAfter(token).data.pipelineStep == 1
+        && request.resource.data.steps[0].status == getAfter(token).data.status
+        && request.resource.data.steps[0].tokenNumber == getAfter(token).data.tokenNumber
+        && getAfter(token).data.status in ['scheduled', 'waiting'];
+    }
+
+    function validPipelineRunAdvance(orgId, pipelineId, runId) {
+      let token = queueTokenPath(orgId, request.resource.data.currentQueueId, request.resource.data.currentTokenId);
+      let previous = queueTokenPath(orgId, resource.data.currentQueueId, resource.data.currentTokenId);
+      let pipeline = get(pipelinePath(orgId, pipelineId)).data;
+      return request.auth.uid == resource.data.userId
+        && resource.data.status == 'ready'
+        && request.resource.data.status == 'active'
+        && request.resource.data.pipelineId == pipelineId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.currentStep == resource.data.currentStep + 1
+        && request.resource.data.currentStep <= pipeline.queueIds.size()
+        && request.resource.data.currentQueueId == pipeline.queueIds[request.resource.data.currentStep - 1]
+        && exists(previous)
+        && get(previous).data.status == 'completed'
+        && get(previous).data.pipelineRunId == runId
+        && existsAfter(token)
+        && getAfter(token).data.userId == resource.data.userId
+        && getAfter(token).data.pipelineId == pipelineId
+        && getAfter(token).data.pipelineRunId == runId
+        && getAfter(token).data.pipelineStep == request.resource.data.currentStep
+        && getAfter(token).data.status in ['scheduled', 'waiting']
+        && request.resource.data.steps is list
+        && request.resource.data.steps.size() == resource.data.steps.size() + 1
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].tokenId == request.resource.data.currentTokenId
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].queueId == request.resource.data.currentQueueId
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].status == getAfter(token).data.status
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].tokenNumber == getAfter(token).data.tokenNumber
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'currentStep', 'currentQueueId', 'currentTokenId', 'steps', 'updatedAt'
+        ]);
+    }
+
+    function validPipelineRunCompletion(orgId, pipelineId, runId) {
+      let token = queueTokenPath(orgId, resource.data.currentQueueId, resource.data.currentTokenId);
+      let pipeline = get(pipelinePath(orgId, pipelineId)).data;
+      return isVerifiedOrgAdminFor(orgId)
+        && resource.data.status == 'active'
+        && request.resource.data.status in ['ready', 'completed', 'concluded']
+        && request.resource.data.currentStep == resource.data.currentStep
+        && request.resource.data.currentQueueId == resource.data.currentQueueId
+        && request.resource.data.currentTokenId == resource.data.currentTokenId
+        && existsAfter(token)
+        && getAfter(token).data.pipelineRunId == runId
+        && getAfter(token).data.status in ['completed', 'cancelled', 'no_show']
+        && request.resource.data.steps is list
+        && request.resource.data.steps.size() == resource.data.steps.size()
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].tokenId == resource.data.currentTokenId
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].status == getAfter(token).data.status
+        && (
+          (
+            getAfter(token).data.status == 'completed'
+            && request.resource.data.status == (resource.data.currentStep == pipeline.queueIds.size() ? 'completed' : 'ready')
+          )
+          || (
+            getAfter(token).data.status in ['cancelled', 'no_show']
+            && request.resource.data.status == 'concluded'
+          )
+        )
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'steps', 'updatedAt']);
+    }
+
+    function validPipelineRunConclude(orgId) {
+      return isVerifiedOrgAdminFor(orgId)
+        && resource.data.status == 'ready'
+        && request.resource.data.status == 'concluded'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']);
+    }
+
+    function validPipelineRunOwnerStop(orgId, pipelineId, runId) {
+      let token = queueTokenPath(orgId, resource.data.currentQueueId, resource.data.currentTokenId);
+      return signedIn()
+        && request.auth.uid == resource.data.userId
+        && resource.data.status == 'active'
+        && request.resource.data.status == 'concluded'
+        && request.resource.data.steps is list
+        && request.resource.data.steps.size() == resource.data.steps.size()
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].tokenId == resource.data.currentTokenId
+        && request.resource.data.steps[request.resource.data.steps.size() - 1].status == 'cancelled'
+        && existsAfter(token)
+        && getAfter(token).data.userId == request.auth.uid
+        && getAfter(token).data.pipelineRunId == runId
+        && getAfter(token).data.status == 'cancelled'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'steps', 'updatedAt']);
+    }
+
     function validNewBookingLimitEvent(orgId, uid, queueId, tokenId, date) {
       return existsAfter(queueTokenPath(orgId, queueId, tokenId))
         && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.userId == uid
@@ -348,8 +518,9 @@ service cloud.firestore {
         && resource.data.adminUid == request.auth.uid;
 
       match /bookingLimits/{uid} {
-        allow read: if signedIn()
+        allow get: if signedIn()
           && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+        allow list: if isVerifiedOrgAdminFor(orgId);
         allow create: if signedIn()
           && request.auth.uid == uid
           && validActiveLimitCreate(orgId, uid);
@@ -374,8 +545,9 @@ service cloud.firestore {
         allow delete: if false;
 
         match /days/{date} {
-          allow read: if signedIn()
+          allow get: if signedIn()
             && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+          allow list: if isVerifiedOrgAdminFor(orgId);
           allow create: if signedIn()
             && request.auth.uid == uid
             && validDailyLimitCreate(orgId, uid, date);
@@ -387,8 +559,9 @@ service cloud.firestore {
       }
 
       match /bookingRestrictions/{uid} {
-        allow read: if signedIn()
+        allow get: if signedIn()
           && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+        allow list: if isVerifiedOrgAdminFor(orgId);
         allow create, update: if isVerifiedOrgAdminFor(orgId)
           && request.resource.data.keys().hasOnly(['reason', 'updatedBy', 'updatedAt'])
           && request.resource.data.reason is string
@@ -483,7 +656,8 @@ service cloud.firestore {
             && request.resource.data.keys().hasOnly([
               'tokenNumber', 'userId', 'userName', 'queueId', 'queueName',
               'serviceId', 'serviceName', 'queueDate', 'timeSlot',
-              'counterKey', 'status', 'limitTracked', 'createdAt'
+              'counterKey', 'status', 'limitTracked', 'createdAt',
+              'pipelineId', 'pipelineRunId', 'pipelineStep', 'previousTokenId'
             ])
             && request.resource.data.userId == request.auth.uid
             && request.resource.data.queueId == queueId
@@ -500,6 +674,18 @@ service cloud.firestore {
             && request.resource.data.tokenNumber is int
             && request.resource.data.tokenNumber > 0
             && request.resource.data.createdAt is timestamp
+            && (
+              (
+                !request.resource.data.keys().hasAny(['pipelineId'])
+                && get(/databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)).data.get('pipelineIds', []).size() == 0
+              )
+              || (
+                request.resource.data.keys().hasAll([
+                  'pipelineId', 'pipelineRunId', 'pipelineStep', 'previousTokenId'
+                ])
+                && validPipelineTokenCreate(orgId, queueId, tokenId)
+              )
+            )
             && bookingCountsWithinLimits(
               orgId,
               request.auth.uid,
@@ -539,6 +725,14 @@ service cloud.firestore {
                 request.resource.data.status in ['waiting', 'serving']
                 || tokenCanBecomeInactive(orgId, queueId, tokenId)
               )
+              && (
+                !resource.data.keys().hasAny(['pipelineRunId'])
+                || (
+                  existsAfter(pipelineRunPath(orgId, resource.data.pipelineId, resource.data.pipelineRunId))
+                  && getAfter(pipelineRunPath(orgId, resource.data.pipelineId, resource.data.pipelineRunId)).data.status
+                    in ['ready', 'completed', 'concluded']
+                )
+              )
             )
             || (
               signedIn()
@@ -548,7 +742,47 @@ service cloud.firestore {
               && request.resource.data.cancelledBy == request.auth.uid
               && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledBy'])
               && tokenCanBecomeInactive(orgId, queueId, tokenId)
+              && (
+                !resource.data.keys().hasAny(['pipelineRunId'])
+                || (
+                  existsAfter(pipelineRunPath(orgId, resource.data.pipelineId, resource.data.pipelineRunId))
+                  && getAfter(pipelineRunPath(orgId, resource.data.pipelineId, resource.data.pipelineRunId)).data.status == 'concluded'
+                )
+              )
             );
+          allow delete: if false;
+        }
+      }
+
+      match /pipelines/{pipelineId} {
+        allow read: if true;
+        allow create: if isVerifiedOrgAdminFor(orgId)
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 100
+          && request.resource.data.queueIds is list
+          && request.resource.data.queueIds.size() >= 2
+          && request.resource.data.queueIds.size() <= 20
+          && request.resource.data.published is bool;
+        allow update: if isVerifiedOrgAdminFor(orgId)
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 100
+          && request.resource.data.queueIds is list
+          && request.resource.data.queueIds.size() >= 2
+          && request.resource.data.queueIds.size() <= 20
+          && request.resource.data.published is bool;
+        allow delete: if false;
+
+        match /runs/{runId} {
+          allow read: if signedIn()
+            && (resource.data.userId == request.auth.uid || isVerifiedOrgAdminFor(orgId));
+          allow create: if isEligibleCustomerForOrg(orgId, request.auth.uid)
+            && validPipelineRunCreate(orgId, pipelineId, runId);
+          allow update: if validPipelineRunAdvance(orgId, pipelineId, runId)
+            || validPipelineRunCompletion(orgId, pipelineId, runId)
+            || validPipelineRunConclude(orgId)
+            || validPipelineRunOwnerStop(orgId, pipelineId, runId);
           allow delete: if false;
         }
       }

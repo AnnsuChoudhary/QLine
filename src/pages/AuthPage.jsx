@@ -21,7 +21,14 @@ const PUBLIC_DOMAINS = new Set([
   'icloud.com',
   'proton.me',
 ])
-const categories = ['Clinic', 'Bank', 'Govt Office', 'Service Center']
+const categories = [
+  'College / University',
+  'Corporate / Hiring',
+  'Hospital / Clinic',
+  'Government Office',
+  'Bank / Financial',
+  'Service Center / Other',
+]
 const JOIN_CODE_CHARACTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 function makeJoinCode() {
@@ -295,7 +302,7 @@ export default function AuthPage({ mode }) {
             {mode === 'register' && role === 'organization' && (
               <>
                 <label>Organization name<input required value={orgName} onChange={(event) => setOrgName(event.target.value)} /></label>
-                <label>Category<select value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option key={item}>{item}</option>)}</select></label>
+                <label>Organization type<select value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option key={item}>{item}</option>)}</select></label>
                 <label>Official address / city<input required value={address} onChange={(event) => setAddress(event.target.value)} /></label>
                 <label>Registration / Tax ID<input required value={registrationId} onChange={(event) => setRegistrationId(event.target.value)} /></label>
               </>

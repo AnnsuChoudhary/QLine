@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { collection, doc, getDocs, onSnapshot, query, updateDoc, where } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore'
 import { db } from '../firebase/config.js'
 import AppHeader from '../components/AppHeader.jsx'
 import { useAuth } from '../context/useAuth.js'
-import { formatTokenNumber, joinQueue } from '../queues.js'
+import { formatTokenNumber, joinQueue, updateQueueTokenStatus } from '../queues.js'
 import { getAvailableTimeSlots, getLocalDateKey, isTokenForDate, isValidDateKey } from '../dates.js'
 
 function getErrorMessage(error, fallback) {
@@ -13,7 +13,7 @@ function getErrorMessage(error, fallback) {
 
 export default function OrganizationPage() {
   const { orgSlug } = useParams()
-  const { firebaseUser } = useAuth()
+  const { firebaseUser, profile } = useAuth()
   const [result, setResult] = useState(null)
   const [queueState, setQueueState] = useState({ organizationId: '', queues: [] })
   const [selectedQueueId, setSelectedQueueId] = useState('')
@@ -30,13 +30,14 @@ export default function OrganizationPage() {
   useEffect(() => {
     let active = true
     getDocs(query(collection(db, 'organizations'), where('slug', '==', orgSlug)))
-      .then((snapshot) => {
-        if (active) {
-          setResult({
-            orgSlug,
-            organization: snapshot.empty ? null : { id: snapshot.docs[0].id, ...snapshot.docs[0].data() },
-          })
+      .then(async (snapshot) => {
+        if (!active) return
+        if (!snapshot.empty) {
+          setResult({ orgSlug, organization: { id: snapshot.docs[0].id, ...snapshot.docs[0].data() } })
+          return
         }
+        const byId = await getDoc(doc(db, 'organizations', orgSlug))
+        if (active) setResult({ orgSlug, organization: byId.exists() ? { id: byId.id, ...byId.data() } : null })
       })
       .catch((requestError) => {
         if (active) setResult({ orgSlug, error: getErrorMessage(requestError, 'Could not load this organization.') })
@@ -117,6 +118,11 @@ export default function OrganizationPage() {
       organization?.closingTime || '17:00',
     )
     : []
+  const requiredEmailDomain = typeof organization?.bookingVerification?.requiredEmailDomain === 'string'
+    ? organization.bookingVerification.requiredEmailDomain
+    : ''
+  const queueIsOpenToday = selectedQueue?.status === 'open'
+    && (!selectedQueue.activeDate || selectedQueue.activeDate === today)
 
   const joinSelectedQueue = async () => {
     if (currentToken) return
@@ -134,6 +140,7 @@ export default function OrganizationPage() {
       await joinQueue(organization.id, selectedQueue.id, firebaseUser, {
         serviceId: selectedQueue.id,
         serviceName: selectedQueue.name,
+        profile,
       })
     } catch (requestError) {
       setQueueError(getErrorMessage(requestError, 'Could not join this queue. Please try again.'))
@@ -147,10 +154,11 @@ export default function OrganizationPage() {
       setQueueError('The queue token is no longer available. Refresh the page and try again.')
       return
     }
+    if (!window.confirm('Cancel this token? Repeated cancellations may pause future bookings with this organization.')) return
     setBusy(true)
     setQueueError('')
     try {
-      await updateDoc(doc(db, 'organizations', organization.id, 'queues', selectedQueue.id, 'tokens', currentToken.id), { status: 'cancelled' })
+      await updateQueueTokenStatus(organization.id, selectedQueue.id, currentToken.id, 'cancelled')
     } catch (requestError) {
       setQueueError(getErrorMessage(requestError, 'Could not update this queue token. Please try again.'))
     } finally {
@@ -198,6 +206,7 @@ export default function OrganizationPage() {
         serviceId: bookingService.id,
         serviceName: bookingService.name,
         allowScheduled: true,
+        profile,
       })
       setBookingNotice(`${bookingService.name} is booked for ${bookingDate} at ${bookingTime}. Your token is ${formatTokenNumber(token.tokenNumber)}${token.status === 'waiting' ? ' and is in today’s live queue.' : '.'}`)
       setBookingServiceId('')
@@ -217,11 +226,13 @@ export default function OrganizationPage() {
     <main>
       <AppHeader />
       <section className="page-shell">
-        <div className="page-heading"><div><p className="eyebrow">{organization.category}</p><h1>{organization.name}</h1></div><span className="status-pill">Live</span></div>
+        <div className="page-heading"><div><p className="eyebrow">{organization.category}</p><h1>{organization.name}</h1></div>{selectedQueue && <span className={`status-pill ${queueIsOpenToday ? 'serving' : 'completed'}`}>{queueIsOpenToday ? 'Queue open today' : 'Queue closed'}</span>}</div>
         <div className="organization-grid">
           <section className="panel">
             <h2>Services & scheduled bookings</h2>
             <p className="muted">Choose a date and time window. Your token is reserved for that queue and becomes active when its slot starts.</p>
+            <p className="verification-note">Bookings require a verified email address{requiredEmailDomain ? ` from ${requiredEmailDomain}` : ''}. Verification is checked automatically when you book.</p>
+            <p className="muted">Each account can hold up to 3 active bookings per queue and 5 across this organization, with per-scheduled-date limits of 5 per queue and 10 total. Repeated cancellations or no-shows may pause new bookings under this organization’s policy.</p>
             {offerings.length ? offerings.map((service) => <article className="service-row" key={service.id}>
               <div><strong>{service.name}</strong><small>{service.duration ? `${service.duration} minutes` : service.description || 'Available offering'}</small></div>
               <button className="button primary" type="button" onClick={() => {

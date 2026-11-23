@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { collection, doc, getDoc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore'
+import { collection, deleteDoc, doc, getDoc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where, writeBatch } from 'firebase/firestore'
 import { db } from '../firebase/config.js'
 import { useAuth } from '../context/useAuth.js'
 import AppHeader from '../components/AppHeader.jsx'
 import { getLocalDateKey, isTokenForDate, isTokenTimeDue } from '../dates.js'
-import { formatTokenNumber } from '../queues.js'
+import { formatTokenNumber, updateQueueTokenStatus } from '../queues.js'
+import { BOOKING_PROFILE_FIELDS, emailDomainPattern } from '../bookingVerification.js'
+import { DEFAULT_BOOKING_INTEGRITY, removeActiveBookingFromLimits } from '../bookingLimits.js'
 
 function readQueue(document) {
   const data = document.data()
@@ -21,6 +23,7 @@ function readToken(document) {
   const data = document.data()
   return {
     id: document.id,
+    userId: typeof data?.userId === 'string' ? data.userId : '',
     tokenNumber: Number.isFinite(data?.tokenNumber) ? data.tokenNumber : null,
     userName: typeof data?.userName === 'string' && data.userName.trim() ? data.userName : 'QLine user',
     status: typeof data?.status === 'string' ? data.status : 'waiting',
@@ -28,6 +31,7 @@ function readToken(document) {
     timeSlot: typeof data?.timeSlot === 'string' ? data.timeSlot : '',
     serviceName: typeof data?.serviceName === 'string' ? data.serviceName : '',
     serviceId: typeof data?.serviceId === 'string' ? data.serviceId : '',
+    limitTracked: data?.limitTracked === true,
     createdAt: data?.createdAt,
     ref: document.ref,
   }
@@ -52,16 +56,22 @@ export default function DashboardPage() {
   const [queueState, setQueueState] = useState({ orgId: '', queues: [] })
   const [selectedQueueId, setSelectedQueueId] = useState('')
   const [tokenState, setTokenState] = useState({ queueId: '', tokens: [] })
+  const [dateTokenState, setDateTokenState] = useState({ queueId: '', date: '', tokens: [] })
+  const [restrictionState, setRestrictionState] = useState({ orgId: '', userIds: new Set() })
   const [copied, setCopied] = useState('')
   const [queueName, setQueueName] = useState('')
   const [queuePurpose, setQueuePurpose] = useState('')
   const [serviceName, setServiceName] = useState('')
   const [serviceDuration, setServiceDuration] = useState('')
   const [businessHours, setBusinessHours] = useState({ openingTime: '09:00', closingTime: '17:00' })
+  const [bookingEmailDomain, setBookingEmailDomain] = useState('')
+  const [bookingRequiredProfileFields, setBookingRequiredProfileFields] = useState([])
+  const [bookingIntegrity, setBookingIntegrity] = useState(DEFAULT_BOOKING_INTEGRITY)
   const [appointmentDate, setAppointmentDate] = useState(getLocalDateKey())
   const [appointmentState, setAppointmentState] = useState({ orgId: '', date: '', appointments: [], ready: false })
   const [appointmentError, setAppointmentError] = useState('')
   const [appointmentBusyId, setAppointmentBusyId] = useState('')
+  const [restrictionBusyUid, setRestrictionBusyUid] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const promotedTokenIds = useRef(new Set())
@@ -82,6 +92,16 @@ export default function DashboardPage() {
         setBusinessHours({
           openingTime: typeof data.openingTime === 'string' ? data.openingTime : '09:00',
           closingTime: typeof data.closingTime === 'string' ? data.closingTime : '17:00',
+        })
+        setBookingEmailDomain(typeof data.bookingVerification?.requiredEmailDomain === 'string'
+          ? data.bookingVerification.requiredEmailDomain
+          : '')
+        setBookingRequiredProfileFields(Array.isArray(data.bookingVerification?.requiredProfileFields)
+          ? data.bookingVerification.requiredProfileFields.filter((field) => Object.hasOwn(BOOKING_PROFILE_FIELDS, field))
+          : [])
+        setBookingIntegrity({
+          maxNoShows: data.bookingIntegrity?.maxNoShows ?? DEFAULT_BOOKING_INTEGRITY.maxNoShows,
+          maxCancellations: data.bookingIntegrity?.maxCancellations ?? DEFAULT_BOOKING_INTEGRITY.maxCancellations,
         })
       })
       .catch((requestError) => {
@@ -104,6 +124,7 @@ export default function DashboardPage() {
 
   const queues = queueState.orgId === profile?.orgId ? queueState.queues : []
   const activeQueueId = queues.some((item) => item.id === selectedQueueId) ? selectedQueueId : queues[0]?.id || ''
+  const restrictedUserIds = restrictionState.orgId === profile?.orgId ? restrictionState.userIds : new Set()
 
   useEffect(() => {
     if (!profile?.orgId || !activeQueueId) return undefined
@@ -121,6 +142,35 @@ export default function DashboardPage() {
       }
     }, (requestError) => setError(requestError.message))
   }, [profile?.orgId, activeQueueId])
+
+  useEffect(() => {
+    if (!profile?.orgId || !activeQueueId) return undefined
+    const dateTokensQuery = query(
+      collection(db, 'organizations', profile.orgId, 'queues', activeQueueId, 'tokens'),
+      where('queueDate', '==', appointmentDate),
+    )
+    return onSnapshot(dateTokensQuery, (snapshot) => {
+      try {
+        const tokens = snapshot.docs.map(readToken)
+          .sort((left, right) => (left.tokenNumber ?? 0) - (right.tokenNumber ?? 0))
+        setDateTokenState({ queueId: activeQueueId, date: appointmentDate, tokens })
+      } catch (requestError) {
+        setError(`Could not read tokens for ${appointmentDate}: ${requestError.message}`)
+      }
+    }, (requestError) => setError(`Could not read tokens for ${appointmentDate}: ${requestError.message}`))
+  }, [profile?.orgId, activeQueueId, appointmentDate])
+
+  useEffect(() => {
+    if (!profile?.orgId) return undefined
+    return onSnapshot(
+      collection(db, 'organizations', profile.orgId, 'bookingRestrictions'),
+      (snapshot) => setRestrictionState({
+        orgId: profile.orgId,
+        userIds: new Set(snapshot.docs.map((item) => item.id)),
+      }),
+      (requestError) => setError(`Could not load booking restrictions: ${requestError.message}`),
+    )
+  }, [profile?.orgId])
 
   useEffect(() => {
     if (!profile?.orgId) return undefined
@@ -150,9 +200,8 @@ export default function DashboardPage() {
     .filter((token) => ['waiting', 'serving'].includes(token.status) && isTokenForDate(token, today))
     .sort((left, right) => (left.timeSlot || '').localeCompare(right.timeSlot || '')
       || (left.createdAt?.toMillis?.() ?? 0) - (right.createdAt?.toMillis?.() ?? 0))
-  const dateTokens = tokenState.queueId === activeQueueId
-    ? tokenState.tokens.filter((token) => token.queueDate === appointmentDate)
-      .sort((left, right) => (left.tokenNumber ?? 0) - (right.tokenNumber ?? 0))
+  const dateTokens = dateTokenState.queueId === activeQueueId && dateTokenState.date === appointmentDate
+    ? dateTokenState.tokens
     : []
   const selectedQueue = queues.find((item) => item.id === activeQueueId)
   const selectedQueueIsOpenToday = selectedQueue?.status === 'open'
@@ -257,7 +306,25 @@ export default function DashboardPage() {
         if (nextSnapshot && (!nextSnapshot.exists() || nextSnapshot.data()?.status !== 'waiting')) {
           throw new Error('The next token changed. Refresh the dashboard and try again.')
         }
-        if (currentRef) transaction.update(currentRef, { status: 'completed' })
+        let currentLimitsRef = null
+        let currentLimitsSnapshot = null
+        if (currentSnapshot?.data()?.limitTracked === true
+          && typeof currentSnapshot.data().userId === 'string'
+          && currentSnapshot.data().userId) {
+          currentLimitsRef = doc(db, 'organizations', profile.orgId, 'bookingLimits', currentSnapshot.data().userId)
+          currentLimitsSnapshot = await transaction.get(currentLimitsRef)
+        }
+        if (currentRef) {
+          transaction.update(currentRef, { status: 'completed' })
+          if (currentLimitsSnapshot?.exists()) {
+            transaction.update(currentLimitsRef, removeActiveBookingFromLimits(
+              currentLimitsSnapshot.data(),
+              activeQueueId,
+              currentRef.id,
+              'completed',
+            ))
+          }
+        }
         if (nextRef) transaction.update(nextRef, { status: 'serving', calledAt: serverTimestamp() })
       })
     } catch (requestError) {
@@ -287,9 +354,66 @@ export default function DashboardPage() {
     setBusy(true)
     setError('')
     try {
-      await updateDoc(token.ref, { status: 'cancelled' })
+      await updateQueueTokenStatus(profile.orgId, activeQueueId, token.id, 'cancelled')
     } catch (requestError) {
       setError(`Could not cancel token ${formatTokenNumber(token.tokenNumber)}: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const toggleBookingRestriction = async (token) => {
+    if (!token.userId) {
+      setError('Could not identify the customer account for this token.')
+      return
+    }
+    setRestrictionBusyUid(token.userId)
+    setError('')
+    const restrictionRef = doc(db, 'organizations', profile.orgId, 'bookingRestrictions', token.userId)
+    try {
+      if (restrictedUserIds.has(token.userId)) {
+        await deleteDoc(restrictionRef)
+      } else {
+        await setDoc(restrictionRef, {
+          reason: 'Repeated non-genuine bookings',
+          updatedBy: firebaseUser.uid,
+          updatedAt: serverTimestamp(),
+        })
+      }
+    } catch (requestError) {
+      setError(`Could not update this customer’s booking restriction: ${requestError.message}`)
+    } finally {
+      setRestrictionBusyUid('')
+    }
+  }
+
+  const resetBookingStrikes = async (token) => {
+    if (!token.userId || !token.limitTracked) {
+      setError('Repeat counts are not available for this legacy token.')
+      return
+    }
+    if (!window.confirm(`Reset the no-show and cancellation counts for ${token.userName}?`)) return
+    setRestrictionBusyUid(token.userId)
+    setError('')
+    try {
+      await updateDoc(doc(db, 'organizations', profile.orgId, 'bookingLimits', token.userId), {
+        noShowCount: 0,
+        cancellationCount: 0,
+      })
+    } catch (requestError) {
+      setError(`Could not reset repeat-booking counts: ${requestError.message}`)
+    } finally {
+      setRestrictionBusyUid('')
+    }
+  }
+
+  const markQueueTokenNoShow = async (token) => {
+    setBusy(true)
+    setError('')
+    try {
+      await updateQueueTokenStatus(profile.orgId, activeQueueId, token.id, 'no_show')
+    } catch (requestError) {
+      setError(`Could not mark token ${formatTokenNumber(token.tokenNumber)} as a no-show: ${requestError.message}`)
     } finally {
       setBusy(false)
     }
@@ -310,6 +434,51 @@ export default function DashboardPage() {
       setOrganization((current) => current ? { ...current, ...businessHours } : current)
     } catch (requestError) {
       setError(requestError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const saveBookingVerification = async (event) => {
+    event.preventDefault()
+    const domain = bookingEmailDomain.trim().toLowerCase()
+    if (domain && !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(domain)) {
+      setError('Enter a valid email domain, such as example.org, or leave it blank.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const bookingVerification = {
+        requiredEmailDomain: domain,
+        requiredEmailDomainPattern: domain ? emailDomainPattern(domain) : '',
+        requiredProfileFields: [...new Set(bookingRequiredProfileFields)],
+      }
+      await updateDoc(doc(db, 'organizations', profile.orgId), { bookingVerification })
+      setOrganization((current) => current ? { ...current, bookingVerification } : current)
+    } catch (requestError) {
+      setError(`Could not save booking verification rules: ${requestError.message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const saveBookingIntegrity = async (event) => {
+    event.preventDefault()
+    const { maxNoShows, maxCancellations } = bookingIntegrity
+    if (![maxNoShows, maxCancellations].every((value) => Number.isInteger(Number(value))
+      && Number(value) >= 0 && Number(value) <= 20)) {
+      setError('Repeat limits must be whole numbers from 0 to 20. Use 0 to disable a limit.')
+      return
+    }
+    const policy = { maxNoShows: Number(maxNoShows), maxCancellations: Number(maxCancellations) }
+    setBusy(true)
+    setError('')
+    try {
+      await updateDoc(doc(db, 'organizations', profile.orgId), { bookingIntegrity: policy })
+      setOrganization((current) => current ? { ...current, bookingIntegrity: policy } : current)
+    } catch (requestError) {
+      setError(`Could not save no-show and cancellation limits: ${requestError.message}`)
     } finally {
       setBusy(false)
     }
@@ -422,7 +591,7 @@ export default function DashboardPage() {
         <div className="dashboard-cards">
           <section className="panel live-queue-panel">
             <div className="section-heading"><h2>Live queue · Today</h2>{selectedQueue && <span className="status-pill">{selectedQueue.name}</span>}</div>
-            {activeTokens.length ? activeTokens.slice(0, 5).map((token) => <div className="queue-row" key={token.id}><strong>{formatTokenNumber(token.tokenNumber)}</strong><span>{token.userName}<small>{token.serviceName || selectedQueue?.name}{token.timeSlot ? ` · ${token.timeSlot}` : ''}</small></span><span className="status-pill">{token.status}</span></div>) : <p className="muted">{selectedQueue ? 'No active queue tokens.' : 'Add a queue to start receiving tokens.'}</p>}
+            {activeTokens.length ? activeTokens.slice(0, 5).map((token) => <div className="queue-row" key={token.id}><strong>{formatTokenNumber(token.tokenNumber)}</strong><span>{token.userName}<small>{token.serviceName || selectedQueue?.name}{token.timeSlot ? ` · ${token.timeSlot}` : ''}</small></span><span className={`status-pill ${token.status}`}>{token.status}</span></div>) : <p className="muted">{selectedQueue ? 'No active queue tokens.' : 'Add a queue to start receiving tokens.'}</p>}
             <button className="button primary" type="button" onClick={callNext} disabled={busy || !selectedQueue || !activeTokens.some((token) => token.status === 'waiting' || token.status === 'serving')}>{busy ? 'Updating…' : activeTokens.some((token) => token.status === 'waiting') ? 'Call next token' : 'Finish current token'}</button>
           </section>
           <section className="panel share-panel"><h2>Organization access</h2><label>Join code<div className="copy-row"><strong>{joinCode || '—'}</strong><button className="button secondary" type="button" onClick={() => copy(joinCode, 'code')} disabled={!joinCode}>{copied === 'code' ? 'Copied' : 'Copy'}</button></div></label><label>Shareable booking link<div className="copy-row"><span>{bookingLink || 'Not available'}</span><button className="button secondary" type="button" onClick={() => copy(bookingLink, 'link')} disabled={!bookingLink}>{copied === 'link' ? 'Copied' : 'Copy'}</button></div></label></section>
@@ -456,6 +625,39 @@ export default function DashboardPage() {
             <button className="button primary" type="submit" disabled={busy || !organization}>{busy ? 'Saving…' : 'Save hours'}</button>
           </form>
         </section>
+        <section className="panel schedule-hours verification-settings">
+          <div className="section-heading"><div><p className="eyebrow">AUTOMATED ELIGIBILITY</p><h2>Booking verification</h2></div></div>
+          <p className="muted">Every customer must use a verified email address. You may require an organization email domain and profile details. Firebase security rules check these requirements when a token is created.</p>
+          <p className="muted">Booking limits are enforced per customer: 3 active per queue, 5 active per organization, 5 bookings per queue per scheduled date, and 10 per organization per scheduled date. Cancel invalid tokens or restrict future bookings for repeat abusers from the token list.</p>
+          <form className="service-form" onSubmit={saveBookingVerification}>
+            <label>Allowed email domain (optional)<input type="text" value={bookingEmailDomain} onChange={(event) => setBookingEmailDomain(event.target.value)} placeholder="example.org" autoCapitalize="none" autoComplete="off" /></label>
+            <fieldset className="booking-profile-requirements">
+              <legend>Required customer profile details</legend>
+              {Object.entries(BOOKING_PROFILE_FIELDS).map(([field, label]) => (
+                <label key={field}>
+                  <input
+                    type="checkbox"
+                    checked={bookingRequiredProfileFields.includes(field)}
+                    onChange={() => setBookingRequiredProfileFields((current) => (
+                      current.includes(field)
+                        ? current.filter((item) => item !== field)
+                        : [...current, field]
+                    ))}
+                  />
+                  {label}
+                </label>
+              ))}
+            </fieldset>
+            <button className="button primary" type="submit" disabled={busy || !organization}>{busy ? 'Saving…' : 'Save verification rules'}</button>
+          </form>
+          <h3>No-show and cancellation limits</h3>
+          <p className="muted">After reaching either threshold, the customer cannot create more tokens with this organization. Cancellation limits count customer-cancelled tokens; only admins can mark a no-show. Set 0 to disable either limit.</p>
+          <form className="service-form" onSubmit={saveBookingIntegrity}>
+            <label>Maximum no-shows<input type="number" min="0" max="20" step="1" value={bookingIntegrity.maxNoShows} onChange={(event) => setBookingIntegrity((current) => ({ ...current, maxNoShows: event.target.value }))} required /></label>
+            <label>Maximum cancellations<input type="number" min="0" max="20" step="1" value={bookingIntegrity.maxCancellations} onChange={(event) => setBookingIntegrity((current) => ({ ...current, maxCancellations: event.target.value }))} required /></label>
+            <button className="button primary" type="submit" disabled={busy || !organization}>{busy ? 'Saving…' : 'Save repeat limits'}</button>
+          </form>
+        </section>
         <section className="panel scheduled-appointment-management">
           <div className="section-heading">
             <div><p className="eyebrow">APPOINTMENTS</p><h2>Scheduled appointments</h2></div>
@@ -469,7 +671,13 @@ export default function DashboardPage() {
             <h3>Queue tokens · {appointmentDate}</h3>
             {dateTokens.length ? dateTokens.map((token) => <article className="panel appointment-row" key={token.id}>
               <div><strong>{token.serviceName || selectedQueue?.name || 'Queue'} · {formatTokenNumber(token.tokenNumber)}</strong><small>{token.queueDate}{token.timeSlot ? ` at ${token.timeSlot}` : ''}</small><small>Customer: {token.userName}</small></div>
-              <div className="appointment-actions"><span className="status-pill">{token.status}</span><button className="button secondary" type="button" onClick={() => cancelQueueToken(token)} disabled={busy}>Cancel token</button></div>
+              <div className="appointment-actions">
+                <span className={`status-pill ${token.status}`}>{token.status.replace('_', ' ')}</span>
+                {['scheduled', 'waiting'].includes(token.status) && <button className="button secondary" type="button" onClick={() => markQueueTokenNoShow(token)} disabled={busy}>Mark no-show</button>}
+                {['scheduled', 'waiting', 'serving'].includes(token.status) && <button className="button secondary" type="button" onClick={() => cancelQueueToken(token)} disabled={busy}>Cancel token</button>}
+                <button className="button secondary" type="button" onClick={() => toggleBookingRestriction(token)} disabled={Boolean(restrictionBusyUid)}>{restrictionBusyUid === token.userId ? 'Updating…' : restrictedUserIds.has(token.userId) ? 'Restore bookings' : 'Restrict bookings'}</button>
+                {token.limitTracked && <button className="button secondary" type="button" onClick={() => resetBookingStrikes(token)} disabled={Boolean(restrictionBusyUid)}>{restrictionBusyUid === token.userId ? 'Updating…' : 'Reset repeat counts'}</button>}
+              </div>
             </article>) : <p className="muted">No queue tokens scheduled for this date and queue.</p>}
           </div>
           {!appointmentState.ready || appointmentState.orgId !== profile.orgId || appointmentState.date !== appointmentDate
@@ -483,7 +691,7 @@ export default function DashboardPage() {
                 const canComplete = activeAppointment && appointment.date <= getLocalDateKey()
                 return <article className="panel appointment-row scheduled-appointment-row" key={appointment.id}>
                   <div><strong>{appointment.serviceName}</strong><small>{appointment.date}{appointment.timeSlot ? ` at ${appointment.timeSlot}` : ''}</small><small>Customer: {appointment.userName}</small></div>
-                  <div className="appointment-actions"><span className="status-pill">{appointment.status.replace('_', ' ')}</span>
+                  <div className="appointment-actions"><span className={`status-pill ${appointment.status}`}>{appointment.status.replace('_', ' ')}</span>
                     {canCheckIn && <button className="button secondary" type="button" onClick={() => updateAppointmentStatus(appointment, 'checked_in')} disabled={Boolean(appointmentBusyId)}>{appointmentBusyId === appointment.id ? 'Updating…' : 'Check in'}</button>}
                     {canComplete && <button className="button secondary" type="button" onClick={() => updateAppointmentStatus(appointment, 'completed')} disabled={Boolean(appointmentBusyId)}>Mark completed</button>}
                     {activeAppointment && <button className="button secondary" type="button" onClick={() => updateAppointmentStatus(appointment, 'cancelled')} disabled={Boolean(appointmentBusyId)}>Cancel booking</button>}

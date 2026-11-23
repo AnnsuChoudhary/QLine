@@ -29,6 +29,249 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/organizations/$(orgId)).data.adminUid == request.auth.uid;
     }
 
+    function hasRequiredBookingProfile(orgId, uid) {
+      let organization = get(/databases/$(database)/documents/organizations/$(orgId)).data;
+      let requiredFields = organization.get('bookingVerification', {}).get('requiredProfileFields', []);
+      let userPath = /databases/$(database)/documents/users/$(uid);
+      return requiredFields is list
+        && requiredFields.hasOnly(['admissionId', 'employeeId', 'department'])
+        && requiredFields.size() <= 3
+        && exists(userPath)
+        && (
+          !requiredFields.hasAny(['admissionId'])
+          || (
+            get(userPath).data.get('admissionId', '') is string
+            && get(userPath).data.get('admissionId', '').matches('.*\\S.*')
+          )
+        )
+        && (
+          !requiredFields.hasAny(['employeeId'])
+          || (
+            get(userPath).data.get('employeeId', '') is string
+            && get(userPath).data.get('employeeId', '').matches('.*\\S.*')
+          )
+        )
+        && (
+          !requiredFields.hasAny(['department'])
+          || (
+            get(userPath).data.get('department', '') is string
+            && get(userPath).data.get('department', '').matches('.*\\S.*')
+          )
+        );
+    }
+
+    function isEligibleCustomerForOrg(orgId, uid) {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string
+        && exists(/databases/$(database)/documents/organizations/$(orgId))
+        && get(/databases/$(database)/documents/organizations/$(orgId)).data
+          .get('bookingVerification', {}).get('requiredEmailDomain', '') is string
+        && get(/databases/$(database)/documents/organizations/$(orgId)).data
+          .get('bookingVerification', {}).get('requiredEmailDomainPattern', '') is string
+        && (
+          (
+            get(/databases/$(database)/documents/organizations/$(orgId)).data
+              .get('bookingVerification', {}).get('requiredEmailDomain', '') == ''
+            && get(/databases/$(database)/documents/organizations/$(orgId)).data
+              .get('bookingVerification', {}).get('requiredEmailDomainPattern', '') == ''
+          )
+          || (
+            get(/databases/$(database)/documents/organizations/$(orgId)).data
+              .get('bookingVerification', {}).get('requiredEmailDomain', '') != ''
+            && get(/databases/$(database)/documents/organizations/$(orgId)).data
+              .get('bookingVerification', {}).get('requiredEmailDomainPattern', '') != ''
+            && request.auth.token.email.matches(
+              '(?i).*@'
+                + get(/databases/$(database)/documents/organizations/$(orgId)).data
+                  .get('bookingVerification', {}).get('requiredEmailDomainPattern', '')
+                + '$'
+            )
+          )
+        )
+        && hasRequiredBookingProfile(orgId, uid);
+    }
+
+    function bookingHistoryWithinLimits(orgId, uid) {
+      let organization = get(/databases/$(database)/documents/organizations/$(orgId)).data;
+      let policy = organization.get('bookingIntegrity', {});
+      let limits = getAfter(bookingLimitPath(orgId, uid)).data;
+      let maxNoShows = policy.get('maxNoShows', 3);
+      let maxCancellations = policy.get('maxCancellations', 5);
+      let noShowCount = limits.get('noShowCount', 0);
+      let cancellationCount = limits.get('cancellationCount', 0);
+      return policy is map
+        && maxNoShows is int
+        && maxNoShows >= 0
+        && maxNoShows <= 20
+        && maxCancellations is int
+        && maxCancellations >= 0
+        && maxCancellations <= 20
+        && noShowCount is int
+        && noShowCount >= 0
+        && cancellationCount is int
+        && cancellationCount >= 0
+        && (maxNoShows == 0 || noShowCount < maxNoShows)
+        && (maxCancellations == 0 || cancellationCount < maxCancellations);
+    }
+
+    function bookingLimitPath(orgId, uid) {
+      return /databases/$(database)/documents/organizations/$(orgId)/bookingLimits/$(uid);
+    }
+
+    function dailyBookingLimitPath(orgId, uid, date) {
+      return /databases/$(database)/documents/organizations/$(orgId)/bookingLimits/$(uid)/days/$(date);
+    }
+
+    function queueTokenPath(orgId, queueId, tokenId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)/tokens/$(tokenId);
+    }
+
+    function validNewBookingLimitEvent(orgId, uid, queueId, tokenId, date) {
+      return existsAfter(queueTokenPath(orgId, queueId, tokenId))
+        && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.userId == uid
+        && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.queueId == queueId
+        && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.queueDate == date
+        && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.limitTracked == true
+        && getAfter(queueTokenPath(orgId, queueId, tokenId)).data.status in ['scheduled', 'waiting'];
+    }
+
+    function bookingCountsWithinLimits(orgId, uid, queueId, tokenId, date) {
+      return existsAfter(bookingLimitPath(orgId, uid))
+        && existsAfter(dailyBookingLimitPath(orgId, uid, date))
+        && getAfter(bookingLimitPath(orgId, uid)).data.lastMutationTokenId == tokenId
+        && getAfter(bookingLimitPath(orgId, uid)).data.lastMutationQueueId == queueId
+        && getAfter(bookingLimitPath(orgId, uid)).data.activeTotal <= 5
+        && getAfter(bookingLimitPath(orgId, uid)).data.activeByQueue.get(queueId, 0) <= 3
+        && getAfter(dailyBookingLimitPath(orgId, uid, date)).data.lastMutationTokenId == tokenId
+        && getAfter(dailyBookingLimitPath(orgId, uid, date)).data.lastMutationQueueId == queueId
+        && getAfter(dailyBookingLimitPath(orgId, uid, date)).data.date == date
+        && getAfter(dailyBookingLimitPath(orgId, uid, date)).data.total <= 10
+        && getAfter(dailyBookingLimitPath(orgId, uid, date)).data.byQueue.get(queueId, 0) <= 5
+        && bookingHistoryWithinLimits(orgId, uid);
+    }
+
+    function tokenLimitWasDecremented(orgId, queueId, tokenId, uid) {
+      return exists(bookingLimitPath(orgId, uid))
+        && existsAfter(bookingLimitPath(orgId, uid))
+        && getAfter(bookingLimitPath(orgId, uid)).data.lastMutationTokenId == tokenId
+        && getAfter(bookingLimitPath(orgId, uid)).data.lastMutationQueueId == queueId
+        && getAfter(bookingLimitPath(orgId, uid)).data.activeTotal
+          == get(bookingLimitPath(orgId, uid)).data.activeTotal - 1
+        && getAfter(bookingLimitPath(orgId, uid)).data.activeByQueue.get(queueId, 0)
+          == get(bookingLimitPath(orgId, uid)).data.activeByQueue.get(queueId, 0) - 1;
+    }
+
+    function tokenCanBecomeInactive(orgId, queueId, tokenId) {
+      return resource.data.limitTracked != true
+        || (
+          isVerifiedOrgAdminFor(orgId)
+          && (
+            !(resource.data.userId is string)
+            || resource.data.userId == ''
+            || !exists(bookingLimitPath(orgId, resource.data.userId))
+          )
+        )
+        || tokenLimitWasDecremented(orgId, queueId, tokenId, resource.data.userId);
+    }
+
+    function validActiveLimitCreate(orgId, uid) {
+      let queueId = request.resource.data.lastMutationQueueId;
+      let tokenId = request.resource.data.lastMutationTokenId;
+      let token = queueTokenPath(orgId, queueId, tokenId);
+      return request.resource.data.keys().hasOnly([
+          'activeTotal', 'activeByQueue', 'noShowCount', 'cancellationCount',
+          'lastMutationTokenId', 'lastMutationQueueId'
+        ])
+        && request.resource.data.activeTotal == 1
+        && request.resource.data.noShowCount == 0
+        && request.resource.data.cancellationCount == 0
+        && request.resource.data.activeByQueue is map
+        && request.resource.data.activeByQueue.keys().hasOnly([queueId])
+        && request.resource.data.activeByQueue.get(queueId, 0) == 1
+        && tokenId is string
+        && queueId is string
+        && validNewBookingLimitEvent(orgId, uid, queueId, tokenId, getAfter(token).data.queueDate);
+    }
+
+    function validActiveLimitIncrease(orgId, uid) {
+      let queueId = request.resource.data.lastMutationQueueId;
+      let tokenId = request.resource.data.lastMutationTokenId;
+      let token = queueTokenPath(orgId, queueId, tokenId);
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'activeTotal', 'activeByQueue', 'noShowCount', 'cancellationCount',
+          'lastMutationTokenId', 'lastMutationQueueId'
+        ])
+        && request.resource.data.activeTotal == resource.data.activeTotal + 1
+        && request.resource.data.get('noShowCount', 0) == resource.data.get('noShowCount', 0)
+        && request.resource.data.get('cancellationCount', 0) == resource.data.get('cancellationCount', 0)
+        && request.resource.data.activeByQueue.diff(resource.data.activeByQueue).affectedKeys().hasOnly([queueId])
+        && request.resource.data.activeByQueue.get(queueId, 0)
+          == resource.data.activeByQueue.get(queueId, 0) + 1
+        && validNewBookingLimitEvent(orgId, uid, queueId, tokenId, getAfter(token).data.queueDate);
+    }
+
+    function validActiveLimitDecrease(orgId, uid) {
+      let queueId = request.resource.data.lastMutationQueueId;
+      let tokenId = request.resource.data.lastMutationTokenId;
+      let token = queueTokenPath(orgId, queueId, tokenId);
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'activeTotal', 'activeByQueue', 'noShowCount', 'cancellationCount',
+          'lastMutationTokenId', 'lastMutationQueueId'
+        ])
+        && request.resource.data.activeTotal == resource.data.activeTotal - 1
+        && request.resource.data.activeTotal >= 0
+        && request.resource.data.activeByQueue.diff(resource.data.activeByQueue).affectedKeys().hasOnly([queueId])
+        && request.resource.data.activeByQueue.get(queueId, 0)
+          == resource.data.activeByQueue.get(queueId, 0) - 1
+        && request.resource.data.activeByQueue.get(queueId, 0) >= 0
+        && exists(token)
+        && get(token).data.userId == uid
+        && get(token).data.queueId == queueId
+        && get(token).data.limitTracked == true
+        && get(token).data.status in ['scheduled', 'waiting', 'serving']
+        && existsAfter(token)
+        && getAfter(token).data.status in ['cancelled', 'completed', 'no_show']
+        && getAfter(token).data.diff(get(token).data).affectedKeys().hasOnly(['status', 'cancelledBy'])
+        && (
+          getAfter(token).data.status == 'cancelled'
+          || !getAfter(token).data.diff(get(token).data).affectedKeys().hasAny(['cancelledBy'])
+        )
+        && request.resource.data.get('noShowCount', 0)
+          == resource.data.get('noShowCount', 0) + (getAfter(token).data.status == 'no_show' ? 1 : 0)
+        && request.resource.data.get('cancellationCount', 0)
+          == resource.data.get('cancellationCount', 0)
+            + (getAfter(token).data.status == 'cancelled'
+              && getAfter(token).data.cancelledBy == uid ? 1 : 0);
+    }
+
+    function validDailyLimitCreate(orgId, uid, date) {
+      let queueId = request.resource.data.lastMutationQueueId;
+      let tokenId = request.resource.data.lastMutationTokenId;
+      return request.resource.data.keys().hasOnly([
+          'total', 'byQueue', 'lastMutationTokenId', 'lastMutationQueueId', 'date'
+        ])
+        && request.resource.data.total == 1
+        && request.resource.data.byQueue is map
+        && request.resource.data.byQueue.keys().hasOnly([queueId])
+        && request.resource.data.byQueue.get(queueId, 0) == 1
+        && request.resource.data.date == date
+        && validNewBookingLimitEvent(orgId, uid, queueId, tokenId, date);
+    }
+
+    function validDailyLimitIncrease(orgId, uid, date) {
+      let queueId = request.resource.data.lastMutationQueueId;
+      let tokenId = request.resource.data.lastMutationTokenId;
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'total', 'byQueue', 'lastMutationTokenId', 'lastMutationQueueId', 'date'
+        ])
+        && request.resource.data.total == resource.data.total + 1
+        && request.resource.data.byQueue.diff(resource.data.byQueue).affectedKeys().hasOnly([queueId])
+        && request.resource.data.byQueue.get(queueId, 0) == resource.data.byQueue.get(queueId, 0) + 1
+        && request.resource.data.date == date
+        && validNewBookingLimitEvent(orgId, uid, queueId, tokenId, date);
+    }
+
     function lastIssuedTokenContinues(orgId, queueId, counterKey, tokenNumber) {
       return resource.data.lastIssuedTokenId is string
         && resource.data.lastIssuedTokenId != ''
@@ -57,7 +300,29 @@ service cloud.firestore {
       allow update: if signedIn()
         && request.auth.uid == uid
         && request.resource.data.role == resource.data.role
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['joinedOrgs']);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'joinedOrgs', 'name', 'admissionId', 'employeeId', 'department'
+        ])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['name'])
+          || (
+            request.resource.data.name is string
+            && request.resource.data.name.size() > 0
+            && request.resource.data.name.size() <= 100
+          )
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['admissionId'])
+          || (request.resource.data.admissionId is string && request.resource.data.admissionId.size() <= 100)
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['employeeId'])
+          || (request.resource.data.employeeId is string && request.resource.data.employeeId.size() <= 100)
+        )
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['department'])
+          || (request.resource.data.department is string && request.resource.data.department.size() <= 100)
+        );
       allow delete: if signedIn() && request.auth.uid == uid;
     }
 
@@ -82,16 +347,62 @@ service cloud.firestore {
       allow delete: if isVerifiedOrgAdmin()
         && resource.data.adminUid == request.auth.uid;
 
+      match /bookingLimits/{uid} {
+        allow read: if signedIn()
+          && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && validActiveLimitCreate(orgId, uid);
+        allow update: if (
+            signedIn()
+            && request.auth.uid == uid
+            && validActiveLimitIncrease(orgId, uid)
+          )
+          || (
+            signedIn()
+            && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId))
+            && validActiveLimitDecrease(orgId, uid)
+          )
+          || (
+            isVerifiedOrgAdminFor(orgId)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'noShowCount', 'cancellationCount'
+            ])
+            && request.resource.data.noShowCount == 0
+            && request.resource.data.cancellationCount == 0
+          );
+        allow delete: if false;
+
+        match /days/{date} {
+          allow read: if signedIn()
+            && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+          allow create: if signedIn()
+            && request.auth.uid == uid
+            && validDailyLimitCreate(orgId, uid, date);
+          allow update: if signedIn()
+            && request.auth.uid == uid
+            && validDailyLimitIncrease(orgId, uid, date);
+          allow delete: if false;
+        }
+      }
+
+      match /bookingRestrictions/{uid} {
+        allow read: if signedIn()
+          && (request.auth.uid == uid || isVerifiedOrgAdminFor(orgId));
+        allow create, update: if isVerifiedOrgAdminFor(orgId)
+          && request.resource.data.keys().hasOnly(['reason', 'updatedBy', 'updatedAt'])
+          && request.resource.data.reason is string
+          && request.resource.data.reason.size() <= 500
+          && request.resource.data.updatedBy == request.auth.uid
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if isVerifiedOrgAdminFor(orgId);
+      }
+
       match /appointments/{appointmentId} {
         allow read: if signedIn()
           && (resource.data.userId == request.auth.uid
             || isVerifiedOrgAdminFor(orgId));
-        allow create: if signedIn()
-          && request.resource.data.userId == request.auth.uid
-          && request.resource.data.status == 'booked'
-          && request.resource.data.serviceId is string
-          && request.resource.data.serviceName is string
-          && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+        allow create: if false;
         allow update: if (
             isVerifiedOrgAdminFor(orgId)
             && resource.data.status in ['booked', 'checked_in']
@@ -112,7 +423,7 @@ service cloud.firestore {
 
       match /queue/{tokenId} {
         allow read: if signedIn();
-        allow create: if signedIn() && request.resource.data.userId == request.auth.uid;
+        allow create: if false;
         allow update, delete: if isVerifiedOrgAdminFor(orgId);
       }
 
@@ -167,17 +478,19 @@ service cloud.firestore {
 
         match /tokens/{tokenId} {
           allow read: if signedIn();
-          allow create: if signedIn()
+          allow create: if isEligibleCustomerForOrg(orgId, request.auth.uid)
+            && !exists(/databases/$(database)/documents/organizations/$(orgId)/bookingRestrictions/$(request.auth.uid))
             && request.resource.data.keys().hasOnly([
               'tokenNumber', 'userId', 'userName', 'queueId', 'queueName',
               'serviceId', 'serviceName', 'queueDate', 'timeSlot',
-              'counterKey', 'status', 'createdAt'
+              'counterKey', 'status', 'limitTracked', 'createdAt'
             ])
             && request.resource.data.userId == request.auth.uid
             && request.resource.data.queueId == queueId
             && request.resource.data.userName is string
             && request.resource.data.queueName is string
             && request.resource.data.status in ['scheduled', 'waiting']
+            && request.resource.data.limitTracked == true
             && request.resource.data.queueDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
             && request.resource.data.timeSlot.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
             && request.resource.data.serviceId is string
@@ -187,6 +500,13 @@ service cloud.firestore {
             && request.resource.data.tokenNumber is int
             && request.resource.data.tokenNumber > 0
             && request.resource.data.createdAt is timestamp
+            && bookingCountsWithinLimits(
+              orgId,
+              request.auth.uid,
+              queueId,
+              tokenId,
+              request.resource.data.queueDate
+            )
             && getAfter(/databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)).data.dailyCounters.get(request.resource.data.counterKey, 0) == request.resource.data.tokenNumber + 1
             && getAfter(/databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)).data.lastIssuedTokenId == tokenId
             && (
@@ -196,15 +516,40 @@ service cloud.firestore {
                 && get(/databases/$(database)/documents/organizations/$(orgId)/queues/$(queueId)).data.get('activeDate', request.resource.data.queueDate) == request.resource.data.queueDate
               )
             );
-          allow update: if isVerifiedOrgAdminFor(orgId)
+          allow update: if (
+              isVerifiedOrgAdminFor(orgId)
+              && resource.data.status in ['scheduled', 'waiting', 'serving']
+              && request.resource.data.status in ['waiting', 'serving', 'completed', 'cancelled', 'no_show']
+              && (
+                request.resource.data.status != 'no_show'
+                || resource.data.status in ['scheduled', 'waiting']
+              )
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                'status', 'calledAt', 'promotedAt', 'cancelledBy'
+              ])
+              && (
+                request.resource.data.status != 'cancelled'
+                || request.resource.data.cancelledBy == request.auth.uid
+              )
+              && (
+                request.resource.data.status == 'cancelled'
+                || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['cancelledBy'])
+              )
+              && (
+                request.resource.data.status in ['waiting', 'serving']
+                || tokenCanBecomeInactive(orgId, queueId, tokenId)
+              )
+            )
             || (
               signedIn()
               && resource.data.userId == request.auth.uid
               && resource.data.status in ['scheduled', 'waiting', 'serving']
               && request.resource.data.status == 'cancelled'
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+              && request.resource.data.cancelledBy == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledBy'])
+              && tokenCanBecomeInactive(orgId, queueId, tokenId)
             );
-          allow delete: if isVerifiedOrgAdminFor(orgId);
+          allow delete: if false;
         }
       }
     }

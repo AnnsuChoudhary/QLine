@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { collection, doc, getDocs, query, updateDoc, where } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, query, updateDoc, where } from 'firebase/firestore'
 import { db } from '../firebase/config.js'
 import { useAuth } from '../context/useAuth.js'
 import AppHeader from '../components/AppHeader.jsx'
@@ -39,7 +39,7 @@ export default function JoinPage() {
         await updateDoc(doc(db, 'users', firebaseUser.uid), { joinedOrgs })
         await refreshProfile(firebaseUser.uid)
       }
-      navigate(`/org/${organization.slug}`)
+      navigate(`/org/${encodeURIComponent(organization.slug || organization.id)}`)
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -52,14 +52,24 @@ export default function JoinPage() {
     setError('')
     setLoading(true)
     try {
-      const normalized = code.trim().toUpperCase()
-      if (!/^[A-Z0-9]{6}$/.test(normalized)) {
-        throw new Error('Enter the 6-character organization join code.')
+      const lookup = code.trim()
+      if (!lookup || lookup.length > 128) {
+        throw new Error('Enter a valid organization code or ID.')
       }
-      const snapshot = await getDocs(query(collection(db, 'organizations'), where('joinCode', '==', normalized)))
-      if (snapshot.empty) throw new Error('No organization found with that join code.')
-      const organization = snapshot.docs[0]
-      await openOrganization({ id: organization.id, ...organization.data() })
+      let organization = null
+      if (/^[A-Za-z0-9]{6}$/.test(lookup)) {
+        const codeSnapshot = await getDocs(query(collection(db, 'organizations'), where('joinCode', '==', lookup.toUpperCase())))
+        if (!codeSnapshot.empty) {
+          const item = codeSnapshot.docs[0]
+          organization = { id: item.id, ...item.data() }
+        }
+      }
+      if (!organization) {
+        const idSnapshot = await getDoc(doc(db, 'organizations', lookup))
+        if (idSnapshot.exists()) organization = { id: idSnapshot.id, ...idSnapshot.data() }
+      }
+      if (!organization) throw new Error('No organization found with that code or ID.')
+      await openOrganization(organization)
     } catch (requestError) {
       setError(requestError.message)
       setLoading(false)
@@ -75,10 +85,10 @@ export default function JoinPage() {
         <div className="page-heading"><div><p className="eyebrow">USER ORGANIZATION HUB</p><h1>Choose an organization</h1></div></div>
         <div className="join-grid">
           <form className="panel join-form" onSubmit={submit}>
-            <h2>Enter a join code</h2>
-            <p>Use the 6-character code shared by an organization.</p>
-            <label>Organization join code<input className="join-code-input" value={code} maxLength={6} placeholder="CLN402" onChange={(event) => setCode(event.target.value.toUpperCase())} required /></label>
-            <button className="button primary" type="submit" disabled={loading}>Find organization</button>
+            <h2>Join by code or ID</h2>
+            <p>Enter the 6-character join code or the organization’s ID.</p>
+            <label>Organization code or ID<input className="join-code-input" value={code} maxLength={128} placeholder="CLN402 or organization ID" onChange={(event) => setCode(event.target.value.trimStart())} required /></label>
+            <button className="button primary" type="submit" disabled={loading}>Find and join</button>
             {error && <p className="form-error" role="alert">{error}</p>}
           </form>
           <section className="panel">

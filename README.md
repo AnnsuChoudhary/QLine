@@ -44,8 +44,27 @@ The API server serves the built application and its `/api` and `/ws` endpoints.
 Run `npm test` for API, persistence, duplicate-booking, queue-flow, and WebSocket
 integration tests.
 
-Self-service customer registration and staff/business access control are
-implemented. Email verification and password reset require an email delivery
-provider and are not configured. Configure HTTPS and `COOKIE_SECURE=true` when
-deploying behind a TLS-terminating proxy, and review the seeded location hours
-before accepting bookings.
+The Firebase-backed UI uses Firebase Auth verification emails. Configure the
+Firebase Auth email templates and authorized domains, and deploy
+`firestore.rules`: queue joins and bookings require a verified email, while
+organization admins can require an email domain and admission ID, employee ID,
+or department in the customer profile. Customers edit those fields on their
+Profile page. The client provides guidance, but Firestore rules enforce email,
+profile, account restriction, and booking-counter checks when tokens are
+created.
+
+Per account and organization, booking rules allow at most 3 active tokens per
+queue, 5 active tokens total, 5 tokens per queue per scheduled date, and 10
+tokens total per scheduled date. The default repeat limits pause new bookings
+after 3 admin-recorded no-shows or 5 customer cancellations; admins can set
+either limit to 0 to disable it. Admins can cancel tokens, mark no-shows,
+restrict or restore accounts, and reset repeat counts. These statuses and
+counters are stored in Firestore; cancellation is a soft removal so the token
+history remains available. Older tokens without limit tracking are not
+retroactively included in these counts.
+
+These are account-level controls, not proof of a person’s identity: there is
+no CAPTCHA or separate fraud-scoring service. The local SQLite API maintains
+separate local accounts and does not use Firebase Auth or these Firestore
+booking rules. Configure HTTPS and `COOKIE_SECURE=true` when deploying that
+API behind a TLS-terminating proxy.
